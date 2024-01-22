@@ -7,10 +7,10 @@ author: ApliNi
 
 commands:
   aup:
-    description: 使用插件命令
+    description: Use plugin commands
     permission: aup.command
 
 permissions:
   aup.command:
-    description: 使用插件命令
+    description: Use plugin commands
     default: op
