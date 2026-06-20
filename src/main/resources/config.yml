@@ -119,6 +119,8 @@ performance:
 rollback:
   # Keep a backup of the previous version when updating a plugin and automatically revert back on plugin load failure (experimental!)
   enabled: false
+  # Restart automatically after rollback restores plugin files. Rollback itself remains disabled unless rollback.enabled is true.
+  restartAfterRollback: true
   # Maximum number of old versions to keep per plugin (0 = unlimited)
   maxBackups: 3
   # Case-insensitive regex patterns that trigger rollback when matched in logs.

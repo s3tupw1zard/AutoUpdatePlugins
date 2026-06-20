@@ -26,7 +26,7 @@ public class AupCommand extends Command implements TabExecutor {
     private final Consumer<Runnable> completionDispatcher;
 
     public AupCommand(PluginUpdater pluginUpdater, File listFile, ConfigManager cfgMgr, Runnable reloadAction, Runnable updateAllAction, Consumer<Runnable> completionDispatcher) {
-        super("aup", "autoupdateplugins.manage", "autoupdateplugins");
+        super("aup", "autoupdateplugins.manage", "autoupdateplugins", "baup", "aupb");
         this.pluginUpdater = pluginUpdater;
         this.listFile = listFile;
         this.cfgMgr = cfgMgr;
@@ -188,6 +188,7 @@ public class AupCommand extends Command implements TabExecutor {
         Map<String, String> targets;
         if (selectors.length == 0) {
             targets = ListEntryLoader.loadEnabledLinks(listFile);
+            pluginUpdater.retainPendingUpdates(targets.keySet());
         } else {
             Map<String, PluginEntry> resolved = resolveEntries(sender, selectors);
             targets = toLinkMap(resolved);
@@ -202,6 +203,7 @@ public class AupCommand extends Command implements TabExecutor {
     }
 
     private void showPending(CommandSender sender) {
+        pluginUpdater.retainPendingUpdates(ListEntryLoader.loadEnabledLinks(listFile).keySet());
         Map<String, PluginUpdater.PendingUpdate> pending = pluginUpdater.getPendingUpdates();
         if (pending.isEmpty()) {
             sender.sendMessage(ChatColor.YELLOW + "No pending updates.");
@@ -248,6 +250,9 @@ public class AupCommand extends Command implements TabExecutor {
                 }
             }
             Files.write(listFile.toPath(), lines, StandardCharsets.UTF_8);
+            if (changed) {
+                pluginUpdater.clearPendingUpdates(names);
+            }
             sender.sendMessage(changed ? ChatColor.GREEN + "Removed " + names.size() + " plugin(s)." : ChatColor.RED + "Nothing matched in list.yml");
         } catch (IOException e) {
             sender.sendMessage(ChatColor.RED + "Failed to remove plugin: " + e.getMessage());
@@ -305,6 +310,9 @@ public class AupCommand extends Command implements TabExecutor {
                 }
             }
             Files.write(listFile.toPath(), lines, StandardCharsets.UTF_8);
+            if (!enable) {
+                pluginUpdater.clearPendingUpdates(names);
+            }
             if (changed) {
                 sender.sendMessage(ChatColor.GREEN + (enable ? "Enabled " : "Disabled ") + names.size() + " plugin(s).");
             } else {

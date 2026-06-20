@@ -200,6 +200,7 @@ public class AupCommand implements CommandExecutor, TabCompleter {
         Map<String, String> targets;
         if (selectors.length == 0) {
             targets = ListEntryLoader.loadEnabledLinks(listFile);
+            pluginUpdater.retainPendingUpdates(targets.keySet());
         } else {
             Map<String, PluginEntry> resolved = resolveEntries(sender, selectors);
             targets = toLinkMap(resolved);
@@ -214,6 +215,7 @@ public class AupCommand implements CommandExecutor, TabCompleter {
     }
 
     private void showPending(CommandSender sender) {
+        pluginUpdater.retainPendingUpdates(ListEntryLoader.loadEnabledLinks(listFile).keySet());
         Map<String, PluginUpdater.PendingUpdate> pending = pluginUpdater.getPendingUpdates();
         if (pending.isEmpty()) {
             sender.sendMessage(ChatColor.YELLOW + "No pending updates.");
@@ -260,6 +262,7 @@ public class AupCommand implements CommandExecutor, TabCompleter {
             }
             Files.write(listFile.toPath(), lines, StandardCharsets.UTF_8);
             if (changed) {
+                pluginUpdater.clearPendingUpdates(names);
                 sender.sendMessage(ChatColor.GREEN + "Removed " + names.size() + " plugin(s).");
             } else {
                 sender.sendMessage(ChatColor.RED + "Nothing matched in list.yml");
@@ -320,6 +323,9 @@ public class AupCommand implements CommandExecutor, TabCompleter {
                 }
             }
             Files.write(listFile.toPath(), lines, StandardCharsets.UTF_8);
+            if (!enable) {
+                pluginUpdater.clearPendingUpdates(names);
+            }
             if (changed) {
                 sender.sendMessage(ChatColor.GREEN + (enable ? "Enabled " : "Disabled ") + names.size() + " plugin(s).");
             } else {

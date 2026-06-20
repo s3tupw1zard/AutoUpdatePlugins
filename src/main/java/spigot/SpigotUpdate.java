@@ -104,11 +104,15 @@ public final class SpigotUpdate extends JavaPlugin {
         RollbackManager.refreshConfiguration(getLogger());
         String platform = serverPlatform();
         if (UpdateOptions.rollbackEnabled) {
+            RollbackManager.setRollbackListener((rollbackPlatform, pluginName) -> scheduleRestart(true));
             RollbackManager.processPendingRollbacks(getLogger(), platform);
             setupRollbackMonitor(platform);
-        } else if (rollbackMonitor != null) {
-            rollbackMonitor.detach();
-            rollbackMonitor = null;
+        } else {
+            RollbackManager.setRollbackListener(null);
+            if (rollbackMonitor != null) {
+                rollbackMonitor.detach();
+                rollbackMonitor = null;
+            }
         }
     }
 
@@ -156,6 +160,7 @@ public final class SpigotUpdate extends JavaPlugin {
 
     private void runManualModeSchedule() {
         LinkedHashMap<String, String> enabled = ListEntryLoader.loadEnabledLinks(myFile);
+        pluginUpdater.retainPendingUpdates(enabled.keySet());
         if (enabled.isEmpty()) {
             return;
         }
@@ -200,43 +205,53 @@ public final class SpigotUpdate extends JavaPlugin {
     }
 
     private void scheduleRestart() {
+        scheduleRestart(false);
+    }
+
+    private void scheduleRestart(boolean rollbackRestart) {
         if (!restartScheduled.compareAndSet(false, true)) {
             return;
         }
         long delaySec = Math.max(0, UpdateOptions.restartDelaySec);
         long delayTicks = Math.max(0, delaySec) * 20L;
 
-        scheduleLegacyRestartMessage(delaySec);
-        scheduleLegacyPreRestartCommand(delaySec);
-        scheduleConfiguredRestartActions(delaySec);
+        scheduleLegacyRestartMessage(delaySec, rollbackRestart);
+        scheduleLegacyPreRestartCommand(delaySec, rollbackRestart);
+        scheduleConfiguredRestartActions(delaySec, rollbackRestart);
 
         Bukkit.getScheduler().runTaskLater(this, () -> {
-            if (!UpdateOptions.restartAfterUpdate) {
+            if (!isRestartEnabled(rollbackRestart)) {
                 restartScheduled.set(false);
                 return;
             }
-            getLogger().info("[AutoUpdatePlugins] Restarting server to apply updates.");
+            getLogger().info(rollbackRestart
+                    ? "[AutoUpdatePlugins] Restarting server to finalize rollback."
+                    : "[AutoUpdatePlugins] Restarting server to apply updates.");
             Bukkit.shutdown();
         }, delayTicks);
     }
 
-    private void scheduleLegacyRestartMessage(long totalDelaySec) {
+    private boolean isRestartEnabled(boolean rollbackRestart) {
+        return rollbackRestart ? UpdateOptions.restartAfterRollback : UpdateOptions.restartAfterUpdate;
+    }
+
+    private void scheduleLegacyRestartMessage(long totalDelaySec, boolean rollbackRestart) {
         String message = formatRestartTemplate(UpdateOptions.restartMessage, totalDelaySec, totalDelaySec);
         if (message == null || message.isEmpty()) {
             return;
         }
-        scheduleRestartAction(0L, () -> Bukkit.broadcastMessage(ChatColor.translateAlternateColorCodes('&', message)));
+        scheduleRestartAction(0L, () -> Bukkit.broadcastMessage(ChatColor.translateAlternateColorCodes('&', message)), rollbackRestart);
     }
 
-    private void scheduleLegacyPreRestartCommand(long totalDelaySec) {
+    private void scheduleLegacyPreRestartCommand(long totalDelaySec, boolean rollbackRestart) {
         String command = formatRestartTemplate(UpdateOptions.preRestartCommand, totalDelaySec, totalDelaySec);
         if (command == null || command.isEmpty()) {
             return;
         }
-        scheduleRestartAction(0L, () -> dispatchConsoleCommand(command));
+        scheduleRestartAction(0L, () -> dispatchConsoleCommand(command), rollbackRestart);
     }
 
-    private void scheduleConfiguredRestartActions(long totalDelaySec) {
+    private void scheduleConfiguredRestartActions(long totalDelaySec, boolean rollbackRestart) {
         List<UpdateOptions.RestartAction> actions = new ArrayList<>(UpdateOptions.restartActions);
         for (UpdateOptions.RestartAction action : actions) {
             if (action == null) continue;
@@ -262,14 +277,14 @@ public final class SpigotUpdate extends JavaPlugin {
                 if (command != null && !command.isEmpty()) {
                     dispatchConsoleCommand(command);
                 }
-            });
+            }, rollbackRestart);
         }
     }
 
-    private void scheduleRestartAction(long runAfterSec, Runnable action) {
+    private void scheduleRestartAction(long runAfterSec, Runnable action, boolean rollbackRestart) {
         long ticks = Math.max(0, runAfterSec) * 20L;
         Bukkit.getScheduler().runTaskLater(this, () -> {
-            if (!UpdateOptions.restartAfterUpdate) {
+            if (!isRestartEnabled(rollbackRestart)) {
                 return;
             }
             action.run();
@@ -407,7 +422,10 @@ public final class SpigotUpdate extends JavaPlugin {
             UpdateOptions.backoffMaxMs = Math.max(UpdateOptions.backoffBaseMs, config.getInt("performance.backoffMaxMs"));
             UpdateOptions.maxPerHost = Math.max(1, config.getInt("performance.maxPerHost"));
             UpdateOptions.rollbackEnabled = config.getBoolean("rollback.enabled");
-            UpdateOptions.rollbackMaxCopies = Math.max(1, config.getInt("rollback.maxBackups"));
+            UpdateOptions.restartAfterRollback = cfgMgr != null && cfgMgr.contains("rollback.restartAfterRollback")
+                    ? cfgMgr.getBoolean("rollback.restartAfterRollback")
+                    : true;
+            UpdateOptions.rollbackMaxCopies = Math.max(0, config.getInt("rollback.maxBackups"));
             UpdateOptions.githubTokens.clear();
             org.bukkit.configuration.ConfigurationSection tokenSection = config.getConfigurationSection("updates.githubTokens");
             if (tokenSection != null) {
@@ -443,6 +461,7 @@ public final class SpigotUpdate extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        RollbackManager.setRollbackListener(null);
         if (rollbackMonitor != null) {
             rollbackMonitor.detach();
             rollbackMonitor = null;
@@ -531,6 +550,7 @@ public final class SpigotUpdate extends JavaPlugin {
         rollbackFilters.add("Unsupported MC version");
         rollbackFilters.add("You are running an unsupported server version");
         cfgMgr.addDefault("rollback.enabled", false, "Monitor server logs for plugin load errors and restore the previous jar automatically.");
+        cfgMgr.addDefault("rollback.restartAfterRollback", true, "Restart automatically after rollback restores plugin files.");
         cfgMgr.addDefault("rollback.maxBackups", 3, "Maximum rollback snapshots to retain per plugin.");
         cfgMgr.addDefault("rollback.filters", rollbackFilters, "Case-insensitive regex patterns that trigger rollback when matched in logs.");
 

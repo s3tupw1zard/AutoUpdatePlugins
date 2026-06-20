@@ -26,6 +26,7 @@ public final class RollbackManager {
     private static final ThreadLocal<Boolean> REENTRANCY_GUARD = ThreadLocal.withInitial(() -> Boolean.FALSE);
 
     private static volatile Path rollbackRoot;
+    private static volatile RollbackListener rollbackListener;
 
     private static final Pattern[] IDENTIFIER_HINTS = new Pattern[]{
             Pattern.compile("(?i)plugin ['\\\"]?([^'\\\"\\s]+?\\.jar)['\\\"]?"),
@@ -36,6 +37,14 @@ public final class RollbackManager {
     };
 
     private RollbackManager() {
+    }
+
+    public interface RollbackListener {
+        void onRollback(String platform, String pluginName);
+    }
+
+    public static void setRollbackListener(RollbackListener listener) {
+        rollbackListener = listener;
     }
 
     public static void refreshConfiguration(Logger logger) {
@@ -178,9 +187,13 @@ public final class RollbackManager {
         if (restored) {
             if (logger != null) {
                 logger.info("[AutoUpdatePlugins] Rollback completed for " + record.jarKey + ". Trigger: " + triggerMessage);
-                logger.info("[AutoUpdatePlugins] Please restart the " + platform + " server to finalize the rollback.");
+                if (UpdateOptions.restartAfterRollback && rollbackListener != null) {
+                    logger.info("[AutoUpdatePlugins] Restart scheduled to finalize the rollback.");
+                } else {
+                    logger.info("[AutoUpdatePlugins] Please restart the " + platform + " server to finalize the rollback.");
+                }
             }
-            cleanupNewArtifacts(record, logger);
+            notifyRollbackRestored(record, logger, platform);
             return true;
         }
 
@@ -206,6 +219,7 @@ public final class RollbackManager {
             String stamp = STAMP.format(Instant.now());
             Path dest = failedDir.resolve(fileBase + "-" + stamp + ".failed.jar");
             Files.copy(target, dest, StandardCopyOption.REPLACE_EXISTING);
+            trimFailedArchives(failedDir, fileBase);
         } catch (IOException ex) {
             if (UpdateOptions.debug && logger != null) {
                 logger.log(Level.FINE, "[AutoUpdatePlugins] Failed to archive broken binary for " + record.jarKey, ex);
@@ -213,15 +227,15 @@ public final class RollbackManager {
         }
     }
 
-    private static void cleanupNewArtifacts(BackupRecord record, Logger logger) {
-        Path targetPath = record.targetPath;
-        if (targetPath != null && !Objects.equals(targetPath, record.activePath)) {
-            try {
-                Files.deleteIfExists(targetPath);
-            } catch (IOException ex) {
-                if (UpdateOptions.debug && logger != null) {
-                    logger.log(Level.FINE, "[AutoUpdatePlugins] Could not remove staged jar " + targetPath, ex);
-                }
+    private static void notifyRollbackRestored(BackupRecord record, Logger logger, String platform) {
+        if (!UpdateOptions.restartAfterRollback) return;
+        RollbackListener listener = rollbackListener;
+        if (listener == null) return;
+        try {
+            listener.onRollback(platform, record.displayName);
+        } catch (Throwable ex) {
+            if (logger != null) {
+                logger.log(Level.WARNING, "[AutoUpdatePlugins] Rollback restored files but failed to schedule a restart.", ex);
             }
         }
     }
@@ -384,6 +398,22 @@ public final class RollbackManager {
         }
     }
 
+    private static void trimFailedArchives(Path failedDir, String fileBase) {
+        if (failedDir == null || fileBase == null || fileBase.isEmpty() || UpdateOptions.rollbackMaxCopies <= 0) return;
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(failedDir, fileBase + "-*.failed.jar")) {
+            List<Path> archives = new ArrayList<>();
+            for (Path path : stream) archives.add(path);
+            archives.sort((a, b) -> b.getFileName().toString().compareToIgnoreCase(a.getFileName().toString()));
+            for (int i = UpdateOptions.rollbackMaxCopies; i < archives.size(); i++) {
+                try {
+                    Files.deleteIfExists(archives.get(i));
+                } catch (IOException ignored) {
+                }
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
     private static void trimBackups(Path pluginDir) {
         if (pluginDir == null || UpdateOptions.rollbackMaxCopies <= 0) return;
         try (DirectoryStream<Path> stream = Files.newDirectoryStream(pluginDir, "*.jar")) {
@@ -499,6 +529,7 @@ public final class RollbackManager {
     }
 
     private static class BackupRecord {
+        final String displayName;
         final String pluginKey;
         final String jarKey;
         final Path activePath;
@@ -509,6 +540,7 @@ public final class RollbackManager {
         volatile boolean rollbackTriggered;
 
         BackupRecord(String pluginName, String jarName, Path activePath, Path targetPath, Path backupPath, long timestamp) {
+            this.displayName = pluginName != null && !pluginName.trim().isEmpty() ? pluginName : jarName;
             this.pluginKey = normalizeKey(pluginName != null ? pluginName : jarName);
             this.jarKey = normalizeKey(jarName);
             this.activePath = activePath;

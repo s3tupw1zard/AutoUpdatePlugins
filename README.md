@@ -78,7 +78,7 @@
 | **Jenkins**           | Latest build artifacts  | `[N]`, `?get=regex`                                                                                                    |
 | **SpigotMC (Spiget)** | Resource page URL       | Auto-resolves latest                                                                                                   |
 | **dev.bukkit**        | Project page            | Auto-resolves latest                                                                                                   |
-| **Modrinth**          | Project/version URL     | `?get=regex`, `?alpha=true`, `?beta=true`, `?latest=true`                                                              |
+| **Modrinth**          | Project/version URL     | `?get=regex`, `?loader=velocity`, `?platform=bungeecord`, `?alpha=true`, `?beta=true`, `?latest=true`                  |
 | **Hangar**            | Project/releases        | `?get=regex`, `?alpha=true`, `?beta=true`, `?latest=true`, `?channel=release|beta|alpha|latest`                      |
 | **BusyBiscuit**       | Project index           | Auto-resolves                                                                                                          |
 | **blob.build**        | Build artifacts         | `?get=regex`                                                                                                           |
@@ -277,6 +277,8 @@ performance:
 rollback:
   # Keep a backup of the previous version when updating a plugin and automatically revert back on plugin load failure (experimental!)
   enabled: false
+  # Restart automatically after rollback restores plugin files. Rollback itself remains disabled unless rollback.enabled is true.
+  restartAfterRollback: true
   # Maximum number of old versions to keep per plugin (0 = unlimited)
   maxBackups: 3
   # Case-insensitive regex patterns that trigger rollback when matched in logs.
@@ -306,6 +308,7 @@ rollback:
 # - Pre-releases: set behavior.allowPreRelease: true or append ?prerelease=true on a GitHub link.
 # - Channel flags: ?beta=true, ?alpha=true, ?latest=true, or ?channel=Alpha/Beta for Hangar.
 # - Modrinth/Hangar obey the same flags (?alpha, ?beta, ?latest) to pick non-release builds when desired.
+# - Modrinth loader override: append ?loader=velocity or ?platform=bungeecord when the detected server platform is not the desired target.
 # - Groups are supported: add `GroupName:` and indent plugin entries beneath it.
 # - Per-entry install path override: append | plugins/SomeFolder/ (legacy) or | filePath=... | updatePath=... | useUpdateFolder=true
 # - Force source build from GitHub: append ?autobuild=true to a GitHub repo URL.
@@ -320,7 +323,8 @@ rollback:
 - `behavior.ignoreDuplicates`: skips deployment if the incoming jar matches the installed checksum, avoiding pointless
   restarts.
 - `rollback.*`: snapshots the previous jar, keeps a rotating history, and restores automatically when console output
-  matches the configured failure patterns.
+  matches the configured failure patterns. `rollback.maxBackups` also trims archived failed jars per plugin
+  (`0` disables trimming), and `rollback.restartAfterRollback` schedules a restart after a successful restore.
 
 #### Advanced Selectors Cheat Sheet
 
@@ -333,9 +337,10 @@ rollback:
 | `?alpha=true` / `?beta=true` | Prefer that channel while falling back to newer releases if no matching build exists | GitHub, Modrinth, Hangar       |
 | `?latest=true`               | Same as `?prerelease=true`, but intended for explicit "always newest" behaviour      | GitHub, Modrinth, Hangar       |
 | `?channel=release|beta|alpha|latest` | Channel preference (works with Hangar channel names and release-tier preference) | Hangar, GitHub, Modrinth       |
+| `?loader=<name>` / `?platform=<name>` | Override the detected target loader/platform                                    | Modrinth                       |
 | `?autobuild=true`            | Trigger Gradle/Maven source builds when binaries are missing                         | GitHub                         |
 | `?branch=<name>`             | Build a specific GitHub branch instead of the default branch                         | GitHub                         |
-| `?account=<name>`            | Use `updates.githubTokens.<name>` instead of the default `updates.key`               | GitHub                         |
+| `?account=<name>` / `?author=<name>` | Use `updates.githubTokens.<name>` instead of the default `updates.key`        | GitHub                         |
 | `?auto=true`                 | In manual mode, allow this entry to install during scheduled runs                    | All providers                  |
 
 **Key options explained**
@@ -357,7 +362,8 @@ rollback:
 * **`behavior.restartCommands`** - Run multiple timed pre-restart commands/messages (for example at 60/30/5 seconds).
 * **`behavior.debug`** - Verbose logging toggle, also controllable via `/aup debug`.
 * **Manual workflow:** enable `behavior.manualMode` to turn scheduled runs and `/update` into check-only passes, then use `/aup pending` and `/aup update`. Scheduled manual checks still use `updates.interval`/`bootTime`; add `?auto=true` to entries that should keep installing automatically.
-* **`rollback`** - Configure automatic snapshots, retention, and log-match triggers for self-healing updates.
+* **`rollback`** - Configure automatic snapshots, retention, log-match triggers, and `rollback.restartAfterRollback`
+  for self-healing updates.
 * **`paths`** - Customize temp/staging/output locations (falls back to sane defaults).
 * **`performance`** - See [Performance Tuning Guide](#performance-tuning-guide).
 
@@ -563,6 +569,7 @@ If cron is empty, the plugin uses **`interval`** (minutes) with an initial **`bo
 
   ```
   Fancy: "https://modrinth.com/plugin/fancy?alpha=true&get=.*(paper|spigot).*\\.jar"
+  VelocityFancy: "https://modrinth.com/plugin/fancy?loader=velocity"
   ```
 * **Hangar (snapshot channel):**
 

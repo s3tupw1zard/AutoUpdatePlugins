@@ -97,7 +97,7 @@ public final class VelocityUpdate {
         CommandMeta updateMeta = commandManager.metaBuilder("update").plugin(this).build();
         commandManager.register(updateMeta, new UpdateCommand());
 
-        CommandMeta aupMeta = commandManager.metaBuilder("aup").aliases("autoupdateplugins").plugin(this).build();
+        CommandMeta aupMeta = commandManager.metaBuilder("aup").aliases("autoupdateplugins", "vaup", "aupv").plugin(this).build();
         commandManager.register(aupMeta, new AupCommand(pluginUpdater, myFile, cfgMgr, this::reloadPluginConfig, this::runInstallAllWithRestart, task -> proxy.getScheduler().buildTask(this, task).schedule()));
     }
 
@@ -105,11 +105,15 @@ public final class VelocityUpdate {
         RollbackManager.refreshConfiguration(logger);
         String platform = "velocity";
         if (UpdateOptions.rollbackEnabled) {
+            RollbackManager.setRollbackListener((rollbackPlatform, pluginName) -> scheduleVelocityRestart(true));
             RollbackManager.processPendingRollbacks(logger, platform);
             setupRollbackMonitor(platform);
-        } else if (rollbackMonitor != null) {
-            rollbackMonitor.detach();
-            rollbackMonitor = null;
+        } else {
+            RollbackManager.setRollbackListener(null);
+            if (rollbackMonitor != null) {
+                rollbackMonitor.detach();
+                rollbackMonitor = null;
+            }
         }
     }
 
@@ -126,6 +130,7 @@ public final class VelocityUpdate {
 
     @Subscribe
     public void onProxyShutdown(ProxyShutdownEvent event) {
+        RollbackManager.setRollbackListener(null);
         if (rollbackMonitor != null) {
             rollbackMonitor.detach();
             rollbackMonitor = null;
@@ -194,6 +199,7 @@ public final class VelocityUpdate {
 
     private void runManualModeSchedule() {
         LinkedHashMap<String, String> enabled = ListEntryLoader.loadEnabledLinks(myFile);
+        pluginUpdater.retainPendingUpdates(enabled.keySet());
         if (enabled.isEmpty()) {
             return;
         }
@@ -237,39 +243,49 @@ public final class VelocityUpdate {
     }
 
     private void scheduleVelocityRestart() {
+        scheduleVelocityRestart(false);
+    }
+
+    private void scheduleVelocityRestart(boolean rollbackRestart) {
         if (!restartScheduled.compareAndSet(false, true)) {
             return;
         }
         int delay = Math.max(0, UpdateOptions.restartDelaySec);
         long delaySec = Math.max(0, delay);
 
-        scheduleLegacyRestartMessage(delaySec);
-        scheduleLegacyPreRestartCommand(delaySec);
-        scheduleConfiguredRestartActions(delaySec);
+        scheduleLegacyRestartMessage(delaySec, rollbackRestart);
+        scheduleLegacyPreRestartCommand(delaySec, rollbackRestart);
+        scheduleConfiguredRestartActions(delaySec, rollbackRestart);
 
         proxy.getScheduler().buildTask(this, () -> {
-            if (!UpdateOptions.restartAfterUpdate) {
+            if (!isRestartEnabled(rollbackRestart)) {
                 restartScheduled.set(false);
                 return;
             }
-            logger.info("[AutoUpdatePlugins] Restarting Velocity to apply updates.");
+            logger.info(rollbackRestart
+                    ? "[AutoUpdatePlugins] Restarting Velocity to finalize rollback."
+                    : "[AutoUpdatePlugins] Restarting Velocity to apply updates.");
             proxy.shutdown();
         }).delay(Duration.ofSeconds(delay)).schedule();
     }
 
-    private void scheduleLegacyRestartMessage(long totalDelaySec) {
+    private boolean isRestartEnabled(boolean rollbackRestart) {
+        return rollbackRestart ? UpdateOptions.restartAfterRollback : UpdateOptions.restartAfterUpdate;
+    }
+
+    private void scheduleLegacyRestartMessage(long totalDelaySec, boolean rollbackRestart) {
         String message = formatRestartTemplate(UpdateOptions.restartMessage, totalDelaySec, totalDelaySec);
         if (message == null || message.isEmpty()) return;
-        scheduleRestartAction(0L, () -> broadcastRestartMessage(message));
+        scheduleRestartAction(0L, () -> broadcastRestartMessage(message), rollbackRestart);
     }
 
-    private void scheduleLegacyPreRestartCommand(long totalDelaySec) {
+    private void scheduleLegacyPreRestartCommand(long totalDelaySec, boolean rollbackRestart) {
         String command = formatRestartTemplate(UpdateOptions.preRestartCommand, totalDelaySec, totalDelaySec);
         if (command == null || command.isEmpty()) return;
-        scheduleRestartAction(0L, () -> dispatchConsoleCommand(command));
+        scheduleRestartAction(0L, () -> dispatchConsoleCommand(command), rollbackRestart);
     }
 
-    private void scheduleConfiguredRestartActions(long totalDelaySec) {
+    private void scheduleConfiguredRestartActions(long totalDelaySec, boolean rollbackRestart) {
         List<UpdateOptions.RestartAction> actions = new ArrayList<>(UpdateOptions.restartActions);
         for (UpdateOptions.RestartAction action : actions) {
             if (action == null) continue;
@@ -293,13 +309,13 @@ public final class VelocityUpdate {
                 if (command != null && !command.isEmpty()) {
                     dispatchConsoleCommand(command);
                 }
-            });
+            }, rollbackRestart);
         }
     }
 
-    private void scheduleRestartAction(long runAfterSec, Runnable action) {
+    private void scheduleRestartAction(long runAfterSec, Runnable action, boolean rollbackRestart) {
         proxy.getScheduler().buildTask(this, () -> {
-            if (!UpdateOptions.restartAfterUpdate) {
+            if (!isRestartEnabled(rollbackRestart)) {
                 return;
             }
             action.run();
@@ -438,7 +454,10 @@ public final class VelocityUpdate {
             UpdateOptions.backoffMaxMs = Math.max(UpdateOptions.backoffBaseMs, cfgMgr.getInt("performance.backoffMaxMs"));
             UpdateOptions.maxPerHost = Math.max(1, cfgMgr.getInt("performance.maxPerHost"));
             UpdateOptions.rollbackEnabled = cfgMgr.getBoolean("rollback.enabled");
-            UpdateOptions.rollbackMaxCopies = Math.max(1, cfgMgr.getInt("rollback.maxBackups"));
+            UpdateOptions.restartAfterRollback = cfgMgr.contains("rollback.restartAfterRollback")
+                    ? cfgMgr.getBoolean("rollback.restartAfterRollback")
+                    : true;
+            UpdateOptions.rollbackMaxCopies = Math.max(0, cfgMgr.getInt("rollback.maxBackups"));
             UpdateOptions.githubTokens.clear();
             Map<String, Object> tokenSection = cfgMgr.getSection("updates.githubTokens");
             if (tokenSection != null) {
@@ -537,6 +556,7 @@ public final class VelocityUpdate {
         rollbackFilters.add("Unsupported MC version");
         rollbackFilters.add("You are running an unsupported server version");
         cfgMgr.addDefault("rollback.enabled", false, "Monitor server logs for plugin load errors and restore the previous jar automatically.");
+        cfgMgr.addDefault("rollback.restartAfterRollback", true, "Restart automatically after rollback restores plugin files.");
         cfgMgr.addDefault("rollback.maxBackups", 3, "Maximum rollback snapshots to retain per plugin.");
         cfgMgr.addDefault("rollback.filters", rollbackFilters, "Case-insensitive regex patterns that trigger rollback when matched in logs.");
 

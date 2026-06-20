@@ -193,6 +193,7 @@ public class AupCommand implements SimpleCommand {
         Map<String, String> targets;
         if (selectors.length == 0) {
             targets = ListEntryLoader.loadEnabledLinks(listFile);
+            pluginUpdater.retainPendingUpdates(targets.keySet());
         } else {
             Map<String, PluginEntry> resolved = resolveEntries(source, selectors);
             targets = toLinkMap(resolved);
@@ -207,6 +208,7 @@ public class AupCommand implements SimpleCommand {
     }
 
     private void showPending(CommandSource source) {
+        pluginUpdater.retainPendingUpdates(ListEntryLoader.loadEnabledLinks(listFile).keySet());
         Map<String, PluginUpdater.PendingUpdate> pending = pluginUpdater.getPendingUpdates();
         if (pending.isEmpty()) {
             source.sendMessage(Component.text("No pending updates.").color(NamedTextColor.YELLOW));
@@ -253,6 +255,9 @@ public class AupCommand implements SimpleCommand {
                 }
             }
             Files.write(listFile.toPath(), lines, StandardCharsets.UTF_8);
+            if (changed) {
+                pluginUpdater.clearPendingUpdates(names);
+            }
             source.sendMessage(changed ? success("Removed " + names.size() + " plugin(s).") : error("Nothing matched in list.yml"));
         } catch (IOException e) {
             source.sendMessage(error("Failed to remove plugin: " + e.getMessage()));
@@ -309,6 +314,9 @@ public class AupCommand implements SimpleCommand {
                 }
             }
             Files.write(listFile.toPath(), lines, StandardCharsets.UTF_8);
+            if (!enable) {
+                pluginUpdater.clearPendingUpdates(names);
+            }
             source.sendMessage(changed ? success((enable ? "Enabled " : "Disabled ") + names.size() + " plugin(s).")
                     : Component.text("No changes were needed.").color(NamedTextColor.YELLOW));
         } catch (IOException e) {

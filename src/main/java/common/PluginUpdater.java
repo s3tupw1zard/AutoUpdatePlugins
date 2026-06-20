@@ -364,6 +364,33 @@ public class PluginUpdater {
         return snapshot;
     }
 
+    public void clearPendingUpdates(Collection<String> pluginNames) {
+        if (pluginNames == null || pluginNames.isEmpty()) {
+            return;
+        }
+        for (String pluginName : pluginNames) {
+            clearPendingUpdate(pluginName);
+        }
+    }
+
+    public void retainPendingUpdates(Collection<String> enabledPluginNames) {
+        Set<String> enabled = new HashSet<>();
+        if (enabledPluginNames != null) {
+            for (String pluginName : enabledPluginNames) {
+                String normalized = normalizePendingName(pluginName);
+                if (normalized != null) {
+                    enabled.add(normalized);
+                }
+            }
+        }
+        for (String existing : new ArrayList<>(pendingUpdates.keySet())) {
+            String normalized = normalizePendingName(existing);
+            if (normalized == null || !enabled.contains(normalized)) {
+                pendingUpdates.remove(existing);
+            }
+        }
+    }
+
     public boolean stopUpdates() {
         if (!updating.get()) {
             return false;
@@ -450,6 +477,23 @@ public class PluginUpdater {
             return;
         }
         pendingUpdates.remove(pluginName);
+        String normalized = normalizePendingName(pluginName);
+        if (normalized == null) {
+            return;
+        }
+        for (String existing : new ArrayList<>(pendingUpdates.keySet())) {
+            if (normalized.equals(normalizePendingName(existing))) {
+                pendingUpdates.remove(existing);
+            }
+        }
+    }
+
+    private static String normalizePendingName(String pluginName) {
+        if (pluginName == null) {
+            return null;
+        }
+        String normalized = pluginName.trim().toLowerCase(Locale.ROOT);
+        return normalized.isEmpty() ? null : normalized;
     }
 
     private boolean handleCheckResult(String pluginName, String source, String customPath, PluginDownloader.CheckResult result) {
@@ -1522,6 +1566,7 @@ public class PluginUpdater {
                 query = value.substring(qIndex + 1);
                 getRegex = queryParam(query, "get");
             }
+            platform = resolveModrinthPlatform(platform, query);
 
             ReleasePreference modrinthPreference = parseReleasePreference(query, UpdateOptions.allowPreReleaseDefault);
 
@@ -1548,49 +1593,7 @@ public class PluginUpdater {
                     JsonNode files = version.get("files");
                     if (files == null || !files.isArray()) continue;
 
-                    boolean loaderOk = true;
-                    if (version.has("loaders") && version.get("loaders").isArray() && platform != null && !platform.isEmpty()) {
-                        loaderOk = false;
-                        String p = platform.toLowerCase();
-                        for (JsonNode l : version.get("loaders")) {
-                            String lv = l.asText("").toLowerCase();
-                            if (p.contains("paper")) {
-                                if (lv.contains("paper")) {
-                                    loaderOk = true;
-                                    break;
-                                }
-                            } else if (p.contains("spigot")) {
-                                if (lv.contains("spigot")) {
-                                    loaderOk = true;
-                                    break;
-                                }
-                            } else if (p.contains("bukkit")) {
-                                if (lv.contains("bukkit")) {
-                                    loaderOk = true;
-                                    break;
-                                }
-                            } else if (p.contains("folia")) {
-                                if (lv.contains("folia")) {
-                                    loaderOk = true;
-                                    break;
-                                }
-                            } else if (p.contains("velocity")) {
-                                if (lv.contains("velocity")) {
-                                    loaderOk = true;
-                                    break;
-                                }
-                            } else if (p.contains("bungee")) {
-                                if (lv.contains("bungeecord") || lv.contains("bungee")) {
-                                    loaderOk = true;
-                                    break;
-                                }
-                            } else {
-                                loaderOk = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!loaderOk) continue;
+                    if (!matchesModrinthLoader(version, platform)) continue;
 
                     if (useRegex) {
                         for (JsonNode f : files) {
@@ -1632,6 +1635,43 @@ public class PluginUpdater {
             logger.info("Failed to download plugin from modrinth: " + e.getMessage());
             return false;
         }
+    }
+
+    private String resolveModrinthPlatform(String platform, String query) {
+        String override = firstNonNull(
+                queryParam(query, "loader"),
+                queryParam(query, "platform")
+        );
+        if (override == null || override.trim().isEmpty()) {
+            return platform;
+        }
+        return override.trim();
+    }
+
+    private boolean matchesModrinthLoader(JsonNode version, String platform) {
+        if (version == null || !version.has("loaders") || !version.get("loaders").isArray() || platform == null || platform.isEmpty()) {
+            return true;
+        }
+        String p = platform.toLowerCase(Locale.ROOT);
+        for (JsonNode loader : version.get("loaders")) {
+            String lv = loader.asText("").toLowerCase(Locale.ROOT);
+            if (p.contains("paper")) {
+                if (lv.contains("paper")) return true;
+            } else if (p.contains("spigot")) {
+                if (lv.contains("spigot")) return true;
+            } else if (p.contains("bukkit")) {
+                if (lv.contains("bukkit")) return true;
+            } else if (p.contains("folia")) {
+                if (lv.contains("folia")) return true;
+            } else if (p.contains("velocity")) {
+                if (lv.contains("velocity")) return true;
+            } else if (p.contains("bungee") || p.contains("waterfall")) {
+                if (lv.contains("bungeecord") || lv.contains("bungee") || lv.contains("waterfall")) return true;
+            } else {
+                if (lv.contains(p)) return true;
+            }
+        }
+        return false;
     }
 
     private static JsonNode pickBestFallback(
@@ -2043,10 +2083,10 @@ public class PluginUpdater {
             jenkinsLink = value.substring(0, value.indexOf(multiIdentifier));
         } else {
             jenkinsLink = value;
-            int qi = jenkinsLink.indexOf('?');
-            if (qi != -1) {
-                jenkinsLink = jenkinsLink.substring(0, qi);
-            }
+        }
+        int queryIndex = jenkinsLink.indexOf('?');
+        if (queryIndex != -1) {
+            jenkinsLink = jenkinsLink.substring(0, queryIndex);
         }
         if (!jenkinsLink.endsWith("/")) {
             jenkinsLink += "/";
@@ -2060,6 +2100,10 @@ public class PluginUpdater {
         }
 
         ArrayNode artifacts = (ArrayNode) node.get("artifacts");
+        if (artifacts == null || artifacts.isEmpty()) {
+            logger.info("No Jenkins artifacts found for " + value + ".");
+            return false;
+        }
         String query = null;
         int qIndex = value.indexOf('?');
         if (qIndex != -1) {
@@ -2081,6 +2125,10 @@ public class PluginUpdater {
         }
 
         if (selectedArtifact == null && !artifacts.isEmpty()) {
+            if (getRegexJ != null) {
+                logger.info("No Jenkins artifact matched get-regex for " + value + "; regex=" + getRegexJ);
+                return false;
+            }
             selectedArtifact = artifacts.get(0);
         }
 
@@ -2398,7 +2446,7 @@ public class PluginUpdater {
     }
 
     private String extractPluginIdFromLink(String spigotResourceLink) {
-        Pattern pattern = Pattern.compile("(\\d+)/");
+        Pattern pattern = Pattern.compile("(\\d+)(?:/|\\?|$)");
         Matcher matcher = pattern.matcher(spigotResourceLink);
         if (!matcher.find()) {
             return "";
@@ -2559,15 +2607,24 @@ public class PluginUpdater {
             return defaultToken;
         }
         int qIdx = value.indexOf('?');
-        if (qIdx == -1 || qIdx >= value.length() - 1) {
-            return defaultToken;
+        String query;
+        if (qIdx != -1 && qIdx < value.length() - 1) {
+            query = value.substring(qIdx + 1);
+        } else {
+            int aliasIndex = firstQueryAliasIndex(value, "account", "author");
+            if (aliasIndex == -1 || aliasIndex >= value.length() - 1) {
+                return defaultToken;
+            }
+            query = value.substring(aliasIndex + 1);
         }
-        String query = value.substring(qIdx + 1);
         int pipe = query.indexOf('|');
         if (pipe >= 0) {
             query = query.substring(0, pipe);
         }
-        String account = queryParam(query, "account");
+        String account = firstNonNull(
+                queryParam(query, "account"),
+                queryParam(query, "author")
+        );
         if (account == null || account.trim().isEmpty()) {
             return defaultToken;
         }
@@ -2582,6 +2639,22 @@ public class PluginUpdater {
             return defaultToken;
         }
         return token.trim();
+    }
+
+    private int firstQueryAliasIndex(String value, String... aliases) {
+        if (value == null || aliases == null) {
+            return -1;
+        }
+        String lower = value.toLowerCase(Locale.ROOT);
+        int best = -1;
+        for (String alias : aliases) {
+            if (alias == null || alias.trim().isEmpty()) continue;
+            int idx = lower.indexOf("&" + alias.toLowerCase(Locale.ROOT) + "=");
+            if (idx >= 0 && (best == -1 || idx < best)) {
+                best = idx;
+            }
+        }
+        return best;
     }
 
     private String decode(String s) {
