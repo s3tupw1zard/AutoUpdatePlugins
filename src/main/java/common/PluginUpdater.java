@@ -2043,6 +2043,10 @@ public class PluginUpdater {
             jenkinsLink = value.substring(0, value.indexOf(multiIdentifier));
         } else {
             jenkinsLink = value;
+            int qi = jenkinsLink.indexOf('?');
+            if (qi != -1) {
+                jenkinsLink = jenkinsLink.substring(0, qi);
+            }
         }
         if (!jenkinsLink.endsWith("/")) {
             jenkinsLink += "/";
@@ -2070,7 +2074,7 @@ public class PluginUpdater {
                 selectedArtifact = artifact;
                 break;
             }
-            if (times == artifactNum) {
+            if (getRegexJ == null && times == artifactNum) {
                 selectedArtifact = artifact;
                 break;
             }
