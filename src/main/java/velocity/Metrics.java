@@ -5,8 +5,6 @@ import com.velocitypowered.api.plugin.PluginContainer;
 import com.velocitypowered.api.plugin.PluginDescription;
 import com.velocitypowered.api.plugin.annotation.DataDirectory;
 import com.velocitypowered.api.proxy.ProxyServer;
-import org.slf4j.Logger;
-
 import javax.net.ssl.HttpsURLConnection;
 import java.io.*;
 import java.net.URL;
@@ -20,6 +18,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPOutputStream;
@@ -40,9 +40,9 @@ public class Metrics {
         // The constructor is not meant to be called by the user.
         // The instance is created using Dependency Injection
         @Inject
-        private Factory(ProxyServer server, Logger logger, @DataDirectory Path dataDirectory) {
+        private Factory(ProxyServer server, @DataDirectory Path dataDirectory) {
             this.server = server;
-            this.logger = logger;
+            this.logger = Logger.getLogger("AutoUpdatePlugins");
             this.dataDirectory = dataDirectory;
         }
 
@@ -81,7 +81,7 @@ public class Metrics {
         try {
             config = new MetricsConfig(configFile, true);
         } catch (IOException e) {
-            logger.error("Failed to create bStats config", e);
+            logger.log(Level.SEVERE, "Failed to create bStats config", e);
             return;
         }
         metricsBase =
@@ -94,7 +94,7 @@ public class Metrics {
                         this::appendServiceData,
                         task -> server.getScheduler().buildTask(plugin, task).schedule(),
                         () -> true,
-                        logger::warn,
+                        (message, throwable) -> logger.log(Level.WARNING, message, throwable),
                         logger::info,
                         config.isLogErrorsEnabled(),
                         config.isLogSentDataEnabled(),

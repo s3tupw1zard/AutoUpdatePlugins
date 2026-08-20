@@ -57,11 +57,19 @@ public final class RollbackManager {
     }
 
     public static void prepareBackup(Logger logger, String pluginName, Path installTarget) {
+        prepareBackup(logger, pluginName, installTarget, null);
+    }
+
+    public static void prepareBackup(Logger logger, String pluginName, Path installTarget,
+                                     Path activePathOverride) {
         if (!UpdateOptions.rollbackEnabled) return;
         Path normalizedTarget = normalizePath(installTarget);
         if (normalizedTarget == null) return;
 
-        Path activePath = resolveActivePath(normalizedTarget);
+        Path activePath = normalizePath(activePathOverride);
+        if (activePath == null || !Files.exists(activePath)) {
+            activePath = resolveActivePath(normalizedTarget);
+        }
         if (activePath == null || !Files.exists(activePath)) {
             return;
         }

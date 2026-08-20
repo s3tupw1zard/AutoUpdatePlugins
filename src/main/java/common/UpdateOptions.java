@@ -43,6 +43,31 @@ public class UpdateOptions {
     public static String preRestartCommand = "";
     public static final List<RestartAction> restartActions = Collections.synchronizedList(new ArrayList<RestartAction>());
     public static final Map<String, String> githubTokens = Collections.synchronizedMap(new LinkedHashMap<String, String>());
+    public static final Map<String, String> gitlabTokens = Collections.synchronizedMap(new LinkedHashMap<String, String>());
+    public static final Map<String, String> voxelShopTokens = Collections.synchronizedMap(new LinkedHashMap<String, String>());
+
+    public static boolean metadataCacheEnabled = true;
+    public static String metadataCacheFile = "metadata.json";
+    public static int metadataCacheTtlMinutes = 0;
+    public static boolean skipDownloadWhenMetadataUnchanged = true;
+    public static boolean cacheDirectUrlHeadMetadata = false;
+
+    public static boolean updateLogEnabled = true;
+    public static String updateLogPath = "logs";
+    public static String updateLogFilePattern = "yyyy-MM-dd'.log'";
+    public static int updateLogCommandPageSize = 8;
+    public static boolean updateLogIncludeUnchanged = false;
+    public static boolean updateLogIncludeChecks = true;
+
+    public static String serverMinecraftVersion = "";
+    public static boolean modrinthMinecraftVersionCheck = true;
+    public static boolean hangarMinecraftVersionCheck = true;
+    public static boolean strictMinecraftVersionMetadata = false;
+
+    public static String versionPolicyDefault = "any";
+    public static String unknownVersionPolicy = "allow";
+    public static boolean allowSameVersionSnapshotUpdates = true;
+    public static boolean allowSameVersionReleaseHashUpdates = false;
 
 
     private UpdateOptions() {

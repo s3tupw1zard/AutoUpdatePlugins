@@ -27,13 +27,15 @@ public final class GitHubBuild {
             String ghToken
     ) {
         try {
-            String u = repoUrl.toLowerCase(Locale.ROOT);
+            EntryOptions entryOptions = EntryOptions.parse(repoUrl, log);
+            String normalizedRepoUrl = entryOptions.sourceValue;
+            String u = entryOptions.sourceWithoutQuery.toLowerCase(Locale.ROOT);
             if (!u.startsWith("https://github.com/") && !u.startsWith("http://github.com/")) {
                 if (UpdateOptions.debug)
-                    log.warning("[AutoUpdatePlugins] [DEBUG] Invalid GitHub repository URL: " + repoUrl);
+                    log.warning("[AutoUpdatePlugins] [DEBUG] Invalid GitHub repository URL.");
                 return false;
             }
-            Repo ref = Repo.parse(repoUrl);
+            Repo ref = Repo.parse(normalizedRepoUrl);
             if (!ref.explicitBranch) {
                 String def = fetchDefaultBranch(log, ref, ghToken);
                 if (def != null) ref = ref.withBranch(def);
@@ -54,14 +56,21 @@ public final class GitHubBuild {
 
                 Path project = repoRoot.resolve(ref.name + "-" + ref.branch);
 
-                boolean built = tryGradleThenMaven(log, project);
+                boolean built;
+                BuildLibrarySupport.Provisioned libraries = BuildLibrarySupport.prepare(
+                        entryOptions, work.resolve("build-libraries"));
+                try {
+                    built = tryGradleThenMaven(log, project, libraries);
+                } finally {
+                    libraries.close();
+                }
                 if (built && selectBuiltJarRecursive(log, project, outJar)) {
                     return true;
                 }
 
                 if (tryJitPackSmart(log, ref, outJar)) return true;
 
-                if (UpdateOptions.debug) log.warning("[AutoUpdatePlugins] [DEBUG] No jar produced for " + repoUrl);
+                if (UpdateOptions.debug) log.warning("[AutoUpdatePlugins] [DEBUG] No jar was produced by the GitHub source build.");
                 return false;
             } finally {
                 try {
@@ -142,7 +151,9 @@ public final class GitHubBuild {
     }
 
 
-    private static boolean tryGradleThenMaven(Logger log, Path project) {
+    private static boolean tryGradleThenMaven(Logger log,
+                                               Path project,
+                                               BuildLibrarySupport.Provisioned libraries) {
         boolean isWindows = System.getProperty("os.name").toLowerCase(Locale.ENGLISH).contains("win");
 
         Path gradlew = project.resolve(isWindows ? "gradlew.bat" : "gradlew");
@@ -151,23 +162,27 @@ public final class GitHubBuild {
 
         if (Files.isRegularFile(gradlew)) {
             if (UpdateOptions.debug) log.info("[AutoUpdatePlugins] [DEBUG] Using Gradle wrapper: " + gradlew);
-            if (runBuild(log, project, gradlew, Arrays.asList("build", "-x", "test"))) return true;
+            if (runBuild(log, project, gradlew,
+                    libraries.gradleArguments(Arrays.asList("build", "-x", "test")))) return true;
         }
 
         if (Files.isRegularFile(mvnw)) {
             if (UpdateOptions.debug) log.info("[AutoUpdatePlugins] [DEBUG] Using Maven wrapper: " + mvnw);
-            if (runBuild(log, project, mvnw, Arrays.asList("-q", "-DskipTests", "package"))) return true;
+            if (runBuild(log, project, mvnw,
+                    libraries.mavenArguments(Arrays.asList("-q", "-DskipTests", "package")))) return true;
         }
 
         if (Files.isRegularFile(project.resolve("build.gradle")) || Files.isRegularFile(project.resolve("build.gradle.kts"))) {
             String gradleCmd = isWindows ? "gradle.bat" : "gradle";
             if (UpdateOptions.debug) log.info("[AutoUpdatePlugins] [DEBUG] Trying system Gradle: " + gradleCmd);
-            if (runBuild(log, project, Paths.get(gradleCmd), Arrays.asList("build", "-x", "test"))) return true;
+            if (runBuild(log, project, Paths.get(gradleCmd),
+                    libraries.gradleArguments(Arrays.asList("build", "-x", "test")))) return true;
         }
         if (Files.isRegularFile(project.resolve("pom.xml"))) {
             String mvnCmd = isWindows ? "mvn.cmd" : "mvn";
             if (UpdateOptions.debug) log.info("[AutoUpdatePlugins] [DEBUG] Trying system Maven: " + mvnCmd);
-            return runBuild(log, project, Paths.get(mvnCmd), Arrays.asList("-q", "-DskipTests", "package"));
+            return runBuild(log, project, Paths.get(mvnCmd),
+                    libraries.mavenArguments(Arrays.asList("-q", "-DskipTests", "package")));
         }
         return false;
     }

@@ -1,8 +1,10 @@
 package bungeecord;
 
 import common.ConfigManager;
+import common.HistoryCommandSupport;
 import common.ListEntryLoader;
 import common.PluginUpdater;
+import common.UpdateHistoryLogger;
 import common.UpdateOptions;
 import net.md_5.bungee.api.ChatColor;
 import net.md_5.bungee.api.CommandSender;
@@ -26,7 +28,7 @@ public class AupCommand extends Command implements TabExecutor {
     private final Consumer<Runnable> completionDispatcher;
 
     public AupCommand(PluginUpdater pluginUpdater, File listFile, ConfigManager cfgMgr, Runnable reloadAction, Runnable updateAllAction, Consumer<Runnable> completionDispatcher) {
-        super("aup", "autoupdateplugins.manage", "autoupdateplugins", "baup", "aupb");
+        super("baup", "autoupdateplugins.manage", "aupb", "autoupdateplugins-bungee");
         this.pluginUpdater = pluginUpdater;
         this.listFile = listFile;
         this.cfgMgr = cfgMgr;
@@ -57,11 +59,14 @@ public class AupCommand extends Command implements TabExecutor {
             case "pending":
                 showPending(sender);
                 break;
+            case "log":
+                showHistory(sender, Arrays.copyOfRange(args, 1, args.length));
+                break;
             case "add":
                 if (args.length >= 3) {
                     addPlugin(sender, args[1], joinArgs(args, 2));
                 } else {
-                    sender.sendMessage(ChatColor.RED + "Usage: /aup add <identifier> <link>");
+                    sender.sendMessage(ChatColor.RED + "Usage: /baup add <identifier> <link>");
                 }
                 break;
             case "stop":
@@ -74,7 +79,7 @@ public class AupCommand extends Command implements TabExecutor {
                 if (args.length >= 2) {
                     removePlugins(sender, args[1]);
                 } else {
-                    sender.sendMessage(ChatColor.RED + "Usage: /aup remove <identifier|group>");
+                    sender.sendMessage(ChatColor.RED + "Usage: /baup remove <identifier|group>");
                 }
                 break;
             case "list":
@@ -91,14 +96,14 @@ public class AupCommand extends Command implements TabExecutor {
                 if (args.length >= 2) {
                     setEnabled(sender, args[1], true);
                 } else {
-                    sender.sendMessage(ChatColor.RED + "Usage: /aup enable <identifier|group>");
+                    sender.sendMessage(ChatColor.RED + "Usage: /baup enable <identifier|group>");
                 }
                 break;
             case "disable":
                 if (args.length >= 2) {
                     setEnabled(sender, args[1], false);
                 } else {
-                    sender.sendMessage(ChatColor.RED + "Usage: /aup disable <identifier|group>");
+                    sender.sendMessage(ChatColor.RED + "Usage: /baup disable <identifier|group>");
                 }
                 break;
             case "debug":
@@ -112,23 +117,46 @@ public class AupCommand extends Command implements TabExecutor {
 
     private void sendHelp(CommandSender sender) {
         sender.sendMessage(ChatColor.AQUA + "AutoUpdatePlugins Commands:");
-        sender.sendMessage(ChatColor.AQUA + "/aup update [plugin|group...]" + ChatColor.GRAY + " - Install specific or all plugins");
-        sender.sendMessage(ChatColor.AQUA + "/aup check [plugin|group...]" + ChatColor.GRAY + " - Check for updates without installing");
-        sender.sendMessage(ChatColor.AQUA + "/aup pending" + ChatColor.GRAY + " - Show pending manual updates");
-        sender.sendMessage(ChatColor.AQUA + "/aup stop" + ChatColor.GRAY + " - Stop current updating process");
-        sender.sendMessage(ChatColor.AQUA + "/aup reload" + ChatColor.GRAY + " - Reload plugin configuration");
-        sender.sendMessage(ChatColor.AQUA + "/aup debug <on|off|toggle|status>" + ChatColor.GRAY + " - Verbose debug logging");
-        sender.sendMessage(ChatColor.AQUA + "/aup add <identifier> <link>");
-        sender.sendMessage(ChatColor.AQUA + "/aup remove <identifier|group>");
-        sender.sendMessage(ChatColor.AQUA + "/aup list [page]");
-        sender.sendMessage(ChatColor.AQUA + "/aup enable <identifier|group>");
-        sender.sendMessage(ChatColor.AQUA + "/aup disable <identifier|group>");
+        sender.sendMessage(ChatColor.AQUA + "/baup update [plugin|group...]" + ChatColor.GRAY + " - Install specific or all plugins");
+        sender.sendMessage(ChatColor.AQUA + "/baup check [plugin|group...]" + ChatColor.GRAY + " - Check for updates without installing");
+        sender.sendMessage(ChatColor.AQUA + "/baup pending" + ChatColor.GRAY + " - Show pending manual updates");
+        sender.sendMessage(ChatColor.AQUA + "/baup log [today|yesterday|yyyy-MM-dd|page] [page]" + ChatColor.GRAY + " - Show update history");
+        sender.sendMessage(ChatColor.AQUA + "/baup stop" + ChatColor.GRAY + " - Stop current updating process");
+        sender.sendMessage(ChatColor.AQUA + "/baup reload" + ChatColor.GRAY + " - Reload plugin configuration");
+        sender.sendMessage(ChatColor.AQUA + "/baup debug <on|off|toggle|status>" + ChatColor.GRAY + " - Verbose debug logging");
+        sender.sendMessage(ChatColor.AQUA + "/baup add <identifier> <link>");
+        sender.sendMessage(ChatColor.AQUA + "/baup remove <identifier|group>");
+        sender.sendMessage(ChatColor.AQUA + "/baup list [page]");
+        sender.sendMessage(ChatColor.AQUA + "/baup enable <identifier|group>");
+        sender.sendMessage(ChatColor.AQUA + "/baup disable <identifier|group>");
         sender.sendMessage(ChatColor.GRAY + "Use group:<name> to target a group explicitly.");
     }
 
     private void stopUpdating(CommandSender sender) {
         boolean stopped = pluginUpdater.stopUpdates();
         sender.sendMessage(stopped ? ChatColor.YELLOW + "Stop requested. In-flight downloads may complete." : ChatColor.RED + "No update is currently running.");
+    }
+
+    private void showHistory(CommandSender sender, String[] args) {
+        HistoryCommandSupport.Request request = HistoryCommandSupport.parse(args);
+        if (!request.valid) {
+            sender.sendMessage(ChatColor.RED + request.error.replace("/aup", "/baup"));
+            return;
+        }
+        UpdateHistoryLogger.Page history = pluginUpdater.readHistory(request.day, request.page);
+        if (history == null) {
+            sender.sendMessage(ChatColor.RED + "Update history is unavailable.");
+            return;
+        }
+        sender.sendMessage(ChatColor.AQUA + "AutoUpdatePlugins log " + history.day
+                + ", page " + history.page + "/" + history.totalPages);
+        if (history.lines.isEmpty()) {
+            sender.sendMessage(ChatColor.YELLOW + "No update history for this date.");
+            return;
+        }
+        for (String line : history.lines) {
+            sender.sendMessage(ChatColor.GRAY + HistoryCommandSupport.compactLine(line));
+        }
     }
 
     private void reloadConfig(CommandSender sender) {
@@ -150,7 +178,7 @@ public class AupCommand extends Command implements TabExecutor {
         else if ("off".equalsIgnoreCase(args[0])) next = false;
         else if ("toggle".equalsIgnoreCase(args[0])) next = !current;
         else {
-            sender.sendMessage(ChatColor.RED + "Usage: /aup debug <on|off|toggle|status>");
+            sender.sendMessage(ChatColor.RED + "Usage: /baup debug <on|off|toggle|status>");
             return;
         }
         UpdateOptions.debug = next;
@@ -211,7 +239,18 @@ public class AupCommand extends Command implements TabExecutor {
         }
         sender.sendMessage(ChatColor.AQUA + "Pending updates (" + pending.size() + "):");
         for (PluginUpdater.PendingUpdate update : pending.values()) {
-            sender.sendMessage(ChatColor.YELLOW + update.pluginName + ChatColor.GRAY + " -> /aup update " + update.pluginName);
+            String details = update.versionAndProvider();
+            sender.sendMessage(ChatColor.YELLOW + update.pluginName
+                    + (details.isEmpty() ? "" : ChatColor.GRAY + " (" + details + ")")
+                    + ChatColor.GRAY + (update.requiresManualAction()
+                    ? " -> manual download required" : " -> /baup update " + update.pluginName));
+            if (update.requiresManualAction()) {
+                sender.sendMessage(ChatColor.GRAY + "  " + update.manualReason);
+                sender.sendMessage(ChatColor.AQUA + "  " + update.actionUrl);
+            }
+            if (update.changelogPreview() != null) {
+                sender.sendMessage(ChatColor.DARK_GRAY + "  Changelog: " + ChatColor.GRAY + update.changelogPreview());
+            }
         }
     }
 
@@ -450,7 +489,7 @@ public class AupCommand extends Command implements TabExecutor {
         sender.sendMessage(ChatColor.AQUA + "Check complete: " + summary.available + " available, " + summary.unchanged + " unchanged, " + summary.failed + " failed.");
         if (summary.available > 0) {
             sender.sendMessage(ChatColor.YELLOW + "Available: " + summarizeNames(summary.namesFor(PluginUpdater.EntryResult.AVAILABLE)));
-            sender.sendMessage(ChatColor.GRAY + "Run /aup pending or /aup update <name|group>.");
+            sender.sendMessage(ChatColor.GRAY + "Run /baup pending or /baup update <name|group>.");
         }
         if (summary.failed > 0) {
             sender.sendMessage(ChatColor.RED + "Failed: " + summarizeNames(summary.namesFor(PluginUpdater.EntryResult.FAILED)));
@@ -479,7 +518,7 @@ public class AupCommand extends Command implements TabExecutor {
         if (!sender.hasPermission("autoupdateplugins.manage")) {
             return completions;
         }
-        String[] subs = {"download", "update", "check", "pending", "stop", "reload", "add", "remove", "list", "enable", "disable", "debug"};
+        String[] subs = {"download", "update", "check", "pending", "log", "stop", "reload", "add", "remove", "list", "enable", "disable", "debug"};
         if (args.length == 1) {
             String current = args[0].toLowerCase(Locale.ROOT);
             for (String sub : subs) {
@@ -501,11 +540,29 @@ public class AupCommand extends Command implements TabExecutor {
                     String page = Integer.toString(i);
                     if (page.startsWith(args[1])) completions.add(page);
                 }
+            } else if ("log".equals(sub)) {
+                completions.addAll(HistoryCommandSupport.dateSuggestions(args[1],
+                        pluginUpdater.recentHistoryDays(7)));
+                HistoryCommandSupport.Request today = HistoryCommandSupport.parse(new String[0]);
+                UpdateHistoryLogger.Page todayHistory = pluginUpdater.readHistory(today.day, 1);
+                if (todayHistory != null) {
+                    for (String page : HistoryCommandSupport.pageSuggestions(args[1], todayHistory.totalPages)) {
+                        if (!completions.contains(page)) completions.add(page);
+                    }
+                }
             }
         } else if (args.length > 2) {
             String sub = args[0].toLowerCase(Locale.ROOT);
             if (Arrays.asList("download", "update", "check").contains(sub)) {
                 completions.addAll(selectorSuggestions(args[args.length - 1], ListEntryLoader.SuggestionMode.ENABLED));
+            } else if ("log".equals(sub) && args.length == 3) {
+                HistoryCommandSupport.Request request = HistoryCommandSupport.parse(new String[]{args[1]});
+                if (request.valid) {
+                    UpdateHistoryLogger.Page history = pluginUpdater.readHistory(request.day, 1);
+                    if (history != null) {
+                        completions.addAll(HistoryCommandSupport.pageSuggestions(args[2], history.totalPages));
+                    }
+                }
             }
         }
         return completions;

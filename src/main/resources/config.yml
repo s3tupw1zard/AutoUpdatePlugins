@@ -26,6 +26,11 @@ updates:
   key:
   # Optional named GitHub tokens. Use ?account=name on a GitHub entry to select one.
   githubTokens: {}
+  # Optional named GitLab PRIVATE-TOKEN values. Use ?account=name on a GitLab entry.
+  gitlabTokens: {}
+  # Optional named VoxelShop user tokens for entitled paid resources.
+  # Store a "default" token or select a named token with ?account=name.
+  voxelShopTokens: {}
 
 # HTTP configuration (optional)
 http:
@@ -88,6 +93,43 @@ behavior:
   # Placeholders: {delay}, {seconds}, {timeToRestart}, {totalDelay}, {totalSeconds}
   restartCommands: [ ]
 
+# Lightweight provider metadata cache. Provider metadata is still checked each
+# run; unchanged artifacts skip the large payload download.
+metadata:
+  enabled: true
+  file: "metadata.json"
+  # 0 keeps entries until provider metadata or the managed target changes.
+  ttlMinutes: 0
+  skipDownloadWhenUnchanged: true
+  # Reserved for origins whose direct URLs expose trustworthy HEAD metadata.
+  directUrlHeadMetadata: false
+  # Blank auto-detects on Spigot/Paper/Folia. Set this on proxies when using
+  # Modrinth/Hangar compatibility filtering (for example "1.21.8").
+  minecraftVersion: ""
+
+compatibility:
+  modrinthMinecraftVersionCheck: true
+  hangarMinecraftVersionCheck: true
+  # If false, releases with no compatibility metadata remain eligible.
+  strictMinecraftVersionMetadata: false
+
+versioning:
+  # any | patch (same X.Y) | same-major | none
+  policy: "any"
+  # allow | block when either local or remote version cannot be parsed
+  unknownVersionPolicy: "allow"
+  allowSameVersionSnapshotUpdates: true
+  allowSameVersionReleaseHashUpdates: false
+
+logging:
+  updates:
+    enabled: true
+    path: "logs"
+    filePattern: "yyyy-MM-dd'.log'"
+    commandPageSize: 8
+    includeUnchanged: false
+    includeChecks: true
+
 
 
 # Optional custom paths
@@ -142,8 +184,8 @@ rollback:
 #   Geyser: "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot"
 #   EssentialsXChat: "https://github.com/EssentialsX/Essentials[3]"
 #
-# Supported sources: GitHub (Releases & Actions), Jenkins, SpigotMC (Spiget), dev.bukkit, Modrinth, Hangar,
-# BusyBiscuit, blob.build, Guizhanss v2, MineBBS, CurseForge, local file paths, local scripts,
+# Supported sources: GitHub (Releases & Actions), GitLab packages, Jenkins, SpigotMC (Spiget), dev.bukkit,
+# Modrinth, Hangar, PlaceholderAPI eCloud/ExtendedClip, BusyBiscuit, blob.build, Guizhanss v2, MineBBS, CurseForge, local file paths, local scripts,
 # plus generic pages with direct .jar links.
 #
 # Tips:
@@ -152,4 +194,8 @@ rollback:
 # - Pre-releases: set behavior.allowPreRelease: true or append ?prerelease=true on a GitHub link.
 # - Channel flags: ?beta=true, ?alpha=true, ?latest=true, or ?channel=Alpha/Beta for Hangar.
 # - Modrinth/Hangar obey the same flags (?alpha, ?beta, ?latest) to pick non-release builds when desired.
+# - Compatibility: ?versionCheck=true&mcVersion=1.21.8 (Spigot-family servers auto-detect when mcVersion is omitted).
+# - Version policy: ?versionPolicy=patch|same-major|any|none. Use ?force=true to bypass cache and policy once.
 # - Force source build from GitHub: append ?autobuild=true to a GitHub repo URL.
+# - Supply a missing source-build dependency with a repeated URL-encoded declaration:
+#   ?autobuild=true&buildLib=group:artifact:version=https%3A%2F%2Fexample.com%2Flibrary.jar

@@ -27,38 +27,44 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 public final class SpigotUpdate extends JavaPlugin {
+    private static final Pattern MINECRAFT_VERSION = Pattern.compile("(\\d+\\.\\d+(?:\\.\\d+)?)");
 
     private PluginUpdater pluginUpdater;
     private File myFile;
     private FileConfiguration config;
     private ConfigManager cfgMgr;
     private RollbackMonitor rollbackMonitor;
+    private AupGui aupGui;
     private final AtomicBoolean restartScheduled = new AtomicBoolean(false);
 
     @Override
     public void onEnable() {
         new Metrics(this, 18454);
-        pluginUpdater = new PluginUpdater(this.getLogger());
-        config = getConfig();
         saveDefaultConfig();
+        config = getConfig();
         cfgMgr = new ConfigManager(getDataFolder(), "config.yml");
         generateOrUpdateConfig();
         File dataFolder = getDataFolder();
+        applyHttpConfig();
+        applyBehaviorConfig();
+        pluginUpdater = new PluginUpdater(this.getLogger(), dataFolder.toPath());
+        configureRollback();
         myFile = new File(dataFolder, "list.yml");
         ensureListFileWithExample(myFile);
+        aupGui = new AupGui(this, pluginUpdater, myFile,
+                () -> cfgMgr.getString("updates.key"), this::serverPlatform);
+        getServer().getPluginManager().registerEvents(aupGui, this);
         periodUpdatePlugins();
         getCommand("update").setExecutor(new UpdateCommand());
         if (getCommand("aup") != null) {
-            AupCommand aup = new AupCommand(pluginUpdater, myFile, config, () -> cfgMgr.getString("updates.key"), cfgMgr, this::reloadPluginConfig, this::runInstallAllWithRestart, task -> Bukkit.getScheduler().runTask(this, task));
+            AupCommand aup = new AupCommand(pluginUpdater, myFile, config, () -> cfgMgr.getString("updates.key"), cfgMgr, this::reloadPluginConfig, this::runInstallAllWithRestart, task -> Bukkit.getScheduler().runTask(this, task), aupGui);
             getCommand("aup").setExecutor(aup);
             getCommand("aup").setTabCompleter(aup);
         }
-
-        applyHttpConfig();
-        applyBehaviorConfig();
-        configureRollback();
     }
 
     private void ensureListFileWithExample(File file) {
@@ -87,15 +93,16 @@ public final class SpigotUpdate extends JavaPlugin {
     }
 
     private void reloadPluginConfig() {
+        this.cfgMgr.reloadConfig();
+        generateOrUpdateConfig();
         try {
             this.reloadConfig();
         } catch (Throwable ignored) {
         }
         this.config = getConfig();
-        this.cfgMgr = new ConfigManager(getDataFolder(), "config.yml");
-        generateOrUpdateConfig();
         applyHttpConfig();
         applyBehaviorConfig();
+        pluginUpdater.reloadPersistence();
         configureRollback();
         getLogger().info("AutoUpdatePlugins configuration reloaded.");
     }
@@ -421,11 +428,50 @@ public final class SpigotUpdate extends JavaPlugin {
             UpdateOptions.backoffBaseMs = Math.max(0, config.getInt("performance.backoffBaseMs"));
             UpdateOptions.backoffMaxMs = Math.max(UpdateOptions.backoffBaseMs, config.getInt("performance.backoffMaxMs"));
             UpdateOptions.maxPerHost = Math.max(1, config.getInt("performance.maxPerHost"));
+            if (pluginUpdater == null || !pluginUpdater.isUpdating()) UpdateOptions.hostSemaphores.clear();
             UpdateOptions.rollbackEnabled = config.getBoolean("rollback.enabled");
             UpdateOptions.restartAfterRollback = cfgMgr != null && cfgMgr.contains("rollback.restartAfterRollback")
                     ? cfgMgr.getBoolean("rollback.restartAfterRollback")
                     : true;
             UpdateOptions.rollbackMaxCopies = Math.max(0, config.getInt("rollback.maxBackups"));
+
+            UpdateOptions.metadataCacheEnabled = cfgMgr.getBoolean("metadata.enabled");
+            String metadataFile = cfgMgr.getString("metadata.file");
+            UpdateOptions.metadataCacheFile = metadataFile == null || metadataFile.trim().isEmpty()
+                    ? "metadata.json" : metadataFile.trim();
+            UpdateOptions.metadataCacheTtlMinutes = Math.max(0, cfgMgr.getInt("metadata.ttlMinutes"));
+            UpdateOptions.skipDownloadWhenMetadataUnchanged = cfgMgr.getBoolean("metadata.skipDownloadWhenUnchanged");
+            UpdateOptions.cacheDirectUrlHeadMetadata = cfgMgr.getBoolean("metadata.directUrlHeadMetadata");
+            String configuredMinecraftVersion = cfgMgr.getString("metadata.minecraftVersion");
+            UpdateOptions.serverMinecraftVersion = configuredMinecraftVersion == null
+                    ? "" : configuredMinecraftVersion.trim();
+            if (UpdateOptions.serverMinecraftVersion.isEmpty()) {
+                UpdateOptions.serverMinecraftVersion = detectMinecraftVersion();
+            }
+
+            UpdateOptions.modrinthMinecraftVersionCheck = cfgMgr.getBoolean("compatibility.modrinthMinecraftVersionCheck");
+            UpdateOptions.hangarMinecraftVersionCheck = cfgMgr.getBoolean("compatibility.hangarMinecraftVersionCheck");
+            UpdateOptions.strictMinecraftVersionMetadata = cfgMgr.getBoolean("compatibility.strictMinecraftVersionMetadata");
+
+            String versionPolicy = cfgMgr.getString("versioning.policy");
+            UpdateOptions.versionPolicyDefault = versionPolicy == null || versionPolicy.trim().isEmpty()
+                    ? "any" : versionPolicy.trim();
+            String unknownVersionPolicy = cfgMgr.getString("versioning.unknownVersionPolicy");
+            UpdateOptions.unknownVersionPolicy = unknownVersionPolicy == null || unknownVersionPolicy.trim().isEmpty()
+                    ? "allow" : unknownVersionPolicy.trim();
+            UpdateOptions.allowSameVersionSnapshotUpdates = cfgMgr.getBoolean("versioning.allowSameVersionSnapshotUpdates");
+            UpdateOptions.allowSameVersionReleaseHashUpdates = cfgMgr.getBoolean("versioning.allowSameVersionReleaseHashUpdates");
+
+            UpdateOptions.updateLogEnabled = cfgMgr.getBoolean("logging.updates.enabled");
+            String logPath = cfgMgr.getString("logging.updates.path");
+            UpdateOptions.updateLogPath = logPath == null || logPath.trim().isEmpty() ? "logs" : logPath.trim();
+            String logPattern = cfgMgr.getString("logging.updates.filePattern");
+            UpdateOptions.updateLogFilePattern = logPattern == null || logPattern.trim().isEmpty()
+                    ? "yyyy-MM-dd'.log'" : logPattern.trim();
+            UpdateOptions.updateLogCommandPageSize = Math.max(1, cfgMgr.getInt("logging.updates.commandPageSize"));
+            UpdateOptions.updateLogIncludeUnchanged = cfgMgr.getBoolean("logging.updates.includeUnchanged");
+            UpdateOptions.updateLogIncludeChecks = cfgMgr.getBoolean("logging.updates.includeChecks");
+
             UpdateOptions.githubTokens.clear();
             org.bukkit.configuration.ConfigurationSection tokenSection = config.getConfigurationSection("updates.githubTokens");
             if (tokenSection != null) {
@@ -434,6 +480,30 @@ public final class SpigotUpdate extends JavaPlugin {
                     if (account != null && token != null && !token.trim().isEmpty()) {
                         UpdateOptions.githubTokens.put(account.trim(), token.trim());
                         UpdateOptions.githubTokens.put(account.trim().toLowerCase(Locale.ROOT), token.trim());
+                    }
+                }
+            }
+
+            UpdateOptions.gitlabTokens.clear();
+            org.bukkit.configuration.ConfigurationSection gitlabTokenSection = config.getConfigurationSection("updates.gitlabTokens");
+            if (gitlabTokenSection != null) {
+                for (String account : gitlabTokenSection.getKeys(false)) {
+                    String token = gitlabTokenSection.getString(account);
+                    if (account != null && token != null && !token.trim().isEmpty()) {
+                        UpdateOptions.gitlabTokens.put(account.trim(), token.trim());
+                        UpdateOptions.gitlabTokens.put(account.trim().toLowerCase(Locale.ROOT), token.trim());
+                    }
+                }
+            }
+
+            UpdateOptions.voxelShopTokens.clear();
+            org.bukkit.configuration.ConfigurationSection voxelTokenSection = config.getConfigurationSection("updates.voxelShopTokens");
+            if (voxelTokenSection != null) {
+                for (String account : voxelTokenSection.getKeys(false)) {
+                    String token = voxelTokenSection.getString(account);
+                    if (account != null && token != null && !token.trim().isEmpty()) {
+                        UpdateOptions.voxelShopTokens.put(account.trim(), token.trim());
+                        UpdateOptions.voxelShopTokens.put(account.trim().toLowerCase(Locale.ROOT), token.trim());
                     }
                 }
             }
@@ -455,12 +525,18 @@ public final class SpigotUpdate extends JavaPlugin {
                 }
             }
 
-        } catch (Throwable ignored) {
+        } catch (Throwable configError) {
+            getLogger().log(java.util.logging.Level.WARNING,
+                    "Failed to apply AutoUpdatePlugins behavior configuration", configError);
         }
     }
 
     @Override
     public void onDisable() {
+        if (aupGui != null) {
+            aupGui.close();
+            aupGui = null;
+        }
         RollbackManager.setRollbackListener(null);
         if (rollbackMonitor != null) {
             rollbackMonitor.detach();
@@ -490,11 +566,42 @@ public final class SpigotUpdate extends JavaPlugin {
         } catch (Throwable ignored) {
         }
         try {
-            String v = Bukkit.getVersion();
-            if (v != null && v.toLowerCase().contains("folia")) return "folia";
+            String v = String.valueOf(Bukkit.getName()) + " " + String.valueOf(Bukkit.getVersion());
+            String lower = v.toLowerCase(Locale.ROOT);
+            if (lower.contains("folia")) return "folia";
+            if (lower.contains("purpur")) return "purpur";
+            if (lower.contains("paper")
+                    || lower.contains("pufferfish") || lower.contains("leaf")) return "paper";
         } catch (Throwable ignored) {
         }
-        return "paper";
+        try {
+            Class.forName("org.purpurmc.purpur.PurpurConfig");
+            return "purpur";
+        } catch (Throwable ignored) {
+        }
+        try {
+            Class.forName("com.destroystokyo.paper.PaperConfig");
+            return "paper";
+        } catch (Throwable ignored) {
+        }
+        return "spigot";
+    }
+
+    private String detectMinecraftVersion() {
+        try {
+            String[] candidates = new String[]{Bukkit.getBukkitVersion(), Bukkit.getVersion()};
+            for (String candidate : candidates) {
+                if (candidate == null) {
+                    continue;
+                }
+                Matcher matcher = MINECRAFT_VERSION.matcher(candidate);
+                if (matcher.find()) {
+                    return matcher.group(1);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
     }
 
     private void generateOrUpdateConfig() {
@@ -504,6 +611,8 @@ public final class SpigotUpdate extends JavaPlugin {
         cfgMgr.addDefault("updates.schedule.timezone", "UTC", "The timezone for the cron schedule.");
         cfgMgr.addDefault("updates.key", "", "GitHub token for Actions/authenticated requests (optional)");
         cfgMgr.addDefault("updates.githubTokens", new LinkedHashMap<String, String>(), "Optional named GitHub tokens. Select one per entry with ?account=name.");
+        cfgMgr.addDefault("updates.gitlabTokens", new LinkedHashMap<String, String>(), "Optional named GitLab PRIVATE-TOKEN values. Select one per entry with ?account=name.");
+        cfgMgr.addDefault("updates.voxelShopTokens", new LinkedHashMap<String, String>(), "Optional named VoxelShop user tokens. Select one per entry with ?account=name.");
 
         cfgMgr.addDefault("http.userAgent", "AutoUpdatePlugins", "HTTP User-Agent override (leave blank to auto-rotate)");
         cfgMgr.addDefault("http.headers", new ArrayList<>(), "Extra headers: list of {name, value}");
@@ -537,6 +646,29 @@ public final class SpigotUpdate extends JavaPlugin {
         cfgMgr.addDefault("behavior.restartMessage", "Server restarting to apply updates.", "Broadcast message before restarting (supports {delay}).");
         cfgMgr.addDefault("behavior.preRestartCommand", "", "Console command to run when restart is scheduled (optional).");
         cfgMgr.addDefault("behavior.restartCommands", new ArrayList<>(), "Timed pre-restart actions: list of {timeToRestart, command, message}.");
+
+        cfgMgr.addDefault("metadata.enabled", true, "Cache lightweight provider metadata to avoid unchanged artifact downloads.");
+        cfgMgr.addDefault("metadata.file", "metadata.json", "Metadata cache file, relative to the plugin data folder unless absolute.");
+        cfgMgr.addDefault("metadata.ttlMinutes", 0, "Metadata cache lifetime in minutes (0 keeps entries until provider metadata changes).");
+        cfgMgr.addDefault("metadata.skipDownloadWhenUnchanged", true, "Skip payload downloads when provider metadata and the target jar are unchanged.");
+        cfgMgr.addDefault("metadata.directUrlHeadMetadata", false, "Use HTTP HEAD metadata for direct URLs when the origin supports it.");
+        cfgMgr.addDefault("metadata.minecraftVersion", "", "Minecraft version override; blank auto-detects on Spigot/Paper/Folia.");
+
+        cfgMgr.addDefault("compatibility.modrinthMinecraftVersionCheck", true, "Require Modrinth releases compatible with the server Minecraft version.");
+        cfgMgr.addDefault("compatibility.hangarMinecraftVersionCheck", true, "Require Hangar releases compatible with the server Minecraft version.");
+        cfgMgr.addDefault("compatibility.strictMinecraftVersionMetadata", false, "Reject provider releases whose Minecraft compatibility is unknown.");
+
+        cfgMgr.addDefault("versioning.policy", "any", "Default version policy: any, patch, same-major, or none.");
+        cfgMgr.addDefault("versioning.unknownVersionPolicy", "allow", "Whether updates with unparseable versions are allowed or blocked.");
+        cfgMgr.addDefault("versioning.allowSameVersionSnapshotUpdates", true, "Allow same-version snapshot builds when their metadata or hash changes.");
+        cfgMgr.addDefault("versioning.allowSameVersionReleaseHashUpdates", false, "Allow same-version release builds when their hash changes.");
+
+        cfgMgr.addDefault("logging.updates.enabled", true, "Write update decisions to daily history files.");
+        cfgMgr.addDefault("logging.updates.path", "logs", "Update history directory, relative to the plugin data folder unless absolute.");
+        cfgMgr.addDefault("logging.updates.filePattern", "yyyy-MM-dd'.log'", "Java date pattern used for daily update history file names.");
+        cfgMgr.addDefault("logging.updates.commandPageSize", 8, "Number of update history entries shown by /aup log.");
+        cfgMgr.addDefault("logging.updates.includeUnchanged", false, "Include ordinary duplicate/unchanged payload decisions in update history.");
+        cfgMgr.addDefault("logging.updates.includeChecks", true, "Include available updates found by check-only runs in update history.");
 
         cfgMgr.addDefault("paths.tempPath", "", "Custom temp/cache path (optional)");
         cfgMgr.addDefault("paths.updatePath", "", "Custom update folder path (optional)");

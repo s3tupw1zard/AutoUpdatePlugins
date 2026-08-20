@@ -26,9 +26,11 @@ import java.nio.file.*;
 import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.time.Instant;
+import java.time.LocalDate;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.logging.Level;
@@ -42,6 +44,17 @@ public class PluginUpdater {
 
     private final PluginDownloader pluginDownloader;
     private final Logger logger;
+    private final Path dataFolder;
+    private volatile UpdateMetadataCache metadataCache;
+    private volatile UpdateHistoryLogger historyLogger;
+    private final ModrinthProvider modrinthProvider;
+    private final HangarProvider hangarProvider;
+    private final ExtendedClipProvider extendedClipProvider;
+    private final GitLabProvider gitLabProvider;
+    private final GitHubProvider gitHubProvider;
+    private final JenkinsProvider jenkinsProvider;
+    private final DirectUrlProvider directUrlProvider;
+    private final VoxelShopProvider voxelShopProvider;
     private final AtomicBoolean updating = new AtomicBoolean(false);
     private final AtomicBoolean cancelRequested = new AtomicBoolean(false);
     private final AtomicBoolean updateApplied = new AtomicBoolean(false);
@@ -53,6 +66,9 @@ public class PluginUpdater {
     private static final List<PendingMove> DEFERRED_MOVES = Collections.synchronizedList(new ArrayList<>());
     private static final AtomicBoolean DEFERRED_HOOK_REGISTERED = new AtomicBoolean(false);
     private static final AtomicReference<Logger> DEFERRED_LOGGER = new AtomicReference<>();
+    private static final int MAX_CHANGELOG_RANGE_NOTES = 8;
+    private static final int MAX_CHANGELOG_NOTE_CHARACTERS = 180;
+    private static final int MAX_CHANGELOG_RANGE_CHARACTERS = 2400;
 
     public interface UpdateCompletionListener {
         void onComplete(boolean anyUpdateApplied);
@@ -79,12 +95,75 @@ public class PluginUpdater {
         public final String source;
         public final String targetPath;
         public final long detectedAtMillis;
+        public final String provider;
+        public final String remoteVersion;
+        public final String changelog;
+        public final String actionUrl;
+        public final String manualReason;
 
         PendingUpdate(String pluginName, String source, String targetPath, long detectedAtMillis) {
+            this(pluginName, source, targetPath, detectedAtMillis, null, null, null);
+        }
+
+        PendingUpdate(String pluginName, String source, String targetPath, long detectedAtMillis,
+                      String provider, String remoteVersion, String changelog) {
+            this(pluginName, source, targetPath, detectedAtMillis, provider, remoteVersion,
+                    changelog, null, null);
+        }
+
+        PendingUpdate(String pluginName, String source, String targetPath, long detectedAtMillis,
+                      String provider, String remoteVersion, String changelog,
+                      String actionUrl, String manualReason) {
             this.pluginName = pluginName;
             this.source = source;
             this.targetPath = targetPath;
             this.detectedAtMillis = detectedAtMillis;
+            this.provider = provider;
+            this.remoteVersion = remoteVersion;
+            this.changelog = changelog;
+            this.actionUrl = actionUrl;
+            this.manualReason = manualReason;
+        }
+
+        public String versionAndProvider() {
+            StringBuilder value = new StringBuilder();
+            if (remoteVersion != null && !remoteVersion.trim().isEmpty()) value.append(remoteVersion.trim());
+            if (provider != null && !provider.trim().isEmpty()) {
+                if (value.length() > 0) value.append(" via ");
+                value.append(provider.trim());
+            }
+            return value.toString();
+        }
+
+        public String changelogPreview() {
+            if (changelog == null || changelog.trim().isEmpty()) return null;
+            String preview = preferredChangelogLine(changelog, remoteVersion);
+            preview = preview.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ').trim();
+            while (preview.contains("  ")) preview = preview.replace("  ", " ");
+            return preview.length() > 180 ? preview.substring(0, 177) + "..." : preview;
+        }
+
+        private static String preferredChangelogLine(String changelog, String selectedVersion) {
+            String latest = null;
+            String selected = null;
+            LooseVersion expected = LooseVersion.parse(selectedVersion);
+            for (String rawLine : changelog.replace('\r', '\n').split("\\n+")) {
+                String line = rawLine.trim();
+                if (!line.startsWith("[") || line.indexOf(']') <= 1) continue;
+                latest = line;
+                String label = line.substring(1, line.indexOf(']')).trim();
+                LooseVersion actual = LooseVersion.parse(label);
+                if ((expected.known && actual.known && expected.compareTo(actual) == 0)
+                        || (!expected.known && selectedVersion != null
+                        && selectedVersion.trim().equalsIgnoreCase(label))) {
+                    selected = line;
+                }
+            }
+            return selected != null ? selected : latest != null ? latest : changelog;
+        }
+
+        public boolean requiresManualAction() {
+            return actionUrl != null && !actionUrl.trim().isEmpty();
         }
     }
 
@@ -166,8 +245,50 @@ public class PluginUpdater {
     }
 
     public PluginUpdater(Logger logger) {
+        this(logger, null);
+    }
+
+    public PluginUpdater(Logger logger, Path dataFolder) {
+        this(logger, dataFolder, new ModrinthProvider(), new HangarProvider(),
+                new ExtendedClipProvider(), new GitLabProvider(logger));
+    }
+
+    PluginUpdater(Logger logger, Path dataFolder, ModrinthProvider modrinthProvider,
+                  HangarProvider hangarProvider, ExtendedClipProvider extendedClipProvider,
+                  GitLabProvider gitLabProvider) {
+        this(logger, dataFolder, modrinthProvider, hangarProvider, extendedClipProvider,
+                gitLabProvider, new VoxelShopProvider());
+    }
+
+    PluginUpdater(Logger logger, Path dataFolder, ModrinthProvider modrinthProvider,
+                  HangarProvider hangarProvider, ExtendedClipProvider extendedClipProvider,
+                  GitLabProvider gitLabProvider, VoxelShopProvider voxelShopProvider) {
         this.logger = logger;
+        this.dataFolder = dataFolder == null ? null : dataFolder.toAbsolutePath().normalize();
         pluginDownloader = new PluginDownloader(logger);
+        this.modrinthProvider = modrinthProvider;
+        this.hangarProvider = hangarProvider;
+        this.extendedClipProvider = extendedClipProvider;
+        this.gitLabProvider = gitLabProvider;
+        this.gitHubProvider = new GitHubProvider(logger);
+        this.jenkinsProvider = new JenkinsProvider(logger);
+        this.directUrlProvider = new DirectUrlProvider();
+        this.voxelShopProvider = voxelShopProvider;
+        reloadPersistence();
+    }
+
+    /** Reopens configurable persistence paths after a runtime configuration reload. */
+    public synchronized void reloadPersistence() {
+        metadataCache = UpdateMetadataCache.open(this.dataFolder, logger);
+        historyLogger = UpdateHistoryLogger.open(this.dataFolder, logger);
+    }
+
+    public UpdateHistoryLogger.Page readHistory(LocalDate day, int page) {
+        return historyLogger.read(day, page);
+    }
+
+    public List<LocalDate> recentHistoryDays(int maxDays) {
+        return historyLogger.recentDays(maxDays);
     }
 
     public boolean isUpdating() {
@@ -260,6 +381,7 @@ public class PluginUpdater {
             }
             return;
         }
+        cancelRequested.set(false);
         updateApplied.set(false);
         RunCollector collector = (mode == ExecutionMode.CHECK || runListener != null) ? new RunCollector(mode, orderedLinks.keySet()) : null;
         pluginDownloader.setInstallListener(mode == ExecutionMode.INSTALL ? (name, path) -> {
@@ -267,73 +389,147 @@ public class PluginUpdater {
             clearPendingUpdate(name);
         } : null);
         CompletableFuture.runAsync(() -> {
-            cancelRequested.set(false);
-            if (UpdateOptions.debug) {
-                logger.info("[DEBUG] Starting update run: entries=" + orderedLinks.size() + ", parallel=" + Math.max(1, UpdateOptions.maxParallel));
-            }
-            int parallel = Math.max(1, UpdateOptions.maxParallel);
-            ExecutorService ex = createExecutor(parallel);
-            currentExecutor = ex;
-            Semaphore sem = new Semaphore(parallel);
-            List<Future<?>> futures = new ArrayList<>();
-            for (Map.Entry<String, String> entry : orderedLinks.entrySet()) {
-                futures.add(ex.submit(() -> {
-                    if (cancelRequested.get()) return;
-                    boolean ok = false;
-                    try {
-                        sem.acquire();
-                        if (cancelRequested.get()) return;
-                        executionMode.set(mode);
-                        if (collector != null) {
-                            runCollector.set(collector);
-                        }
-                        ok = handleUpdateEntry(platform, key, entry);
-                    } catch (IOException e) {
-                        ok = false;
-                        logger.log(Level.WARNING, "Update failed for " + entry.getKey(), e);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
-                    } finally {
-                        if (!ok && collector != null) {
-                            collector.recordIfAbsent(entry.getKey(), EntryResult.FAILED);
-                        }
-                        runCollector.remove();
-                        executionMode.remove();
-                        sem.release();
-                    }
-                    if (!ok) {
-                        if (UpdateOptions.debug)
-                            logger.info("[DEBUG] Download failed for " + entry.getKey() + " -> " + entry.getValue());
-                        else logger.info("Download for " + entry.getKey() + " was not successful");
-                    }
-                }));
-            }
-            ex.shutdown();
+            ExecutorService ex = null;
+            ScheduledExecutorService timeoutExecutor = null;
+            boolean interrupted = false;
             try {
-                int cap = UpdateOptions.perDownloadTimeoutSec;
-                if (cap > 0) {
-                    ex.awaitTermination(cap, TimeUnit.SECONDS);
-                } else {
-                    ex.awaitTermination(7, TimeUnit.DAYS);
+                if (UpdateOptions.debug) {
+                    logger.info("[DEBUG] Starting update run: entries=" + orderedLinks.size()
+                            + ", parallel=" + Math.max(1, UpdateOptions.maxParallel));
                 }
-            } catch (InterruptedException ignored) {
-            }
+                int parallel = Math.max(1, UpdateOptions.maxParallel);
+                ex = createExecutor(parallel);
+                currentExecutor = ex;
+                Semaphore sem = new Semaphore(parallel);
+                final int timeoutSeconds = Math.max(0, UpdateOptions.perDownloadTimeoutSec);
+                timeoutExecutor = timeoutSeconds > 0
+                        ? Executors.newScheduledThreadPool(Math.min(parallel, 2), runnable -> {
+                    Thread thread = new Thread(runnable, "aup-download-timeout");
+                    thread.setDaemon(true);
+                    return thread;
+                }) : null;
+                final ScheduledExecutorService taskTimeouts = timeoutExecutor;
 
-        }).whenComplete((v, t) -> {
-            pluginDownloader.setInstallListener(null);
-            updating.set(false);
-            cancelRequested.set(false);
-            currentExecutor = null;
-            RunSummary summary = collector != null ? collector.snapshot(pendingUpdates.size()) : null;
-            if (summary != null) {
-                if (runListener != null) {
-                    runListener.onComplete(summary);
-                } else if (mode == ExecutionMode.CHECK) {
-                    logCheckSummary(summary);
+                if (cancelRequested.get()) {
+                    ex.shutdownNow();
+                } else {
+                    for (Map.Entry<String, String> entry : orderedLinks.entrySet()) {
+                        if (cancelRequested.get()) {
+                            if (collector != null) collector.recordIfAbsent(entry.getKey(), EntryResult.FAILED);
+                            continue;
+                        }
+                        try {
+                            ex.submit(() -> {
+                                boolean ok = false;
+                                boolean acquired = false;
+                                AtomicBoolean timedOut = new AtomicBoolean(false);
+                                AtomicInteger deadlineState = new AtomicInteger(PluginDownloader.DEADLINE_ACTIVE);
+                                ScheduledFuture<?> timeoutTask = null;
+                                try {
+                                    if (cancelRequested.get()) return;
+                                    sem.acquire();
+                                    acquired = true;
+                                    if (cancelRequested.get()) return;
+                                    if (taskTimeouts != null) {
+                                        Thread worker = Thread.currentThread();
+                                        timeoutTask = taskTimeouts.schedule(() -> {
+                                            if (!deadlineState.compareAndSet(PluginDownloader.DEADLINE_ACTIVE,
+                                                    PluginDownloader.DEADLINE_TIMED_OUT)) return;
+                                            timedOut.set(true);
+                                            logger.warning("Update timed out for " + entry.getKey()
+                                                    + " after " + timeoutSeconds + " seconds");
+                                            worker.interrupt();
+                                        }, timeoutSeconds, TimeUnit.SECONDS);
+                                    }
+                                    pluginDownloader.bindTransferDeadline(deadlineState);
+                                    executionMode.set(mode);
+                                    if (collector != null) runCollector.set(collector);
+                                    ok = handleUpdateEntry(platform, key, entry);
+                                    if (timedOut.get() || cancelRequested.get()
+                                            || Thread.currentThread().isInterrupted()) ok = false;
+                                } catch (IOException e) {
+                                    logger.log(Level.WARNING, "Update failed for " + entry.getKey(), e);
+                                } catch (InterruptedException ie) {
+                                    Thread.currentThread().interrupt();
+                                } finally {
+                                    if (timeoutTask != null) timeoutTask.cancel(false);
+                                    deadlineState.compareAndSet(PluginDownloader.DEADLINE_ACTIVE,
+                                            PluginDownloader.DEADLINE_FINISHED);
+                                    if (deadlineState.get() == PluginDownloader.DEADLINE_TIMED_OUT
+                                            || timedOut.get()) ok = false;
+                                    if (!ok && collector != null) {
+                                        if (timedOut.get() || cancelRequested.get()) {
+                                            collector.record(entry.getKey(), EntryResult.FAILED);
+                                        } else {
+                                            collector.recordIfAbsent(entry.getKey(), EntryResult.FAILED);
+                                        }
+                                    }
+                                    pluginDownloader.clearTransferDeadline();
+                                    runCollector.remove();
+                                    executionMode.remove();
+                                    if (acquired) sem.release();
+                                    if (timedOut.get()) Thread.interrupted();
+                                }
+                                if (!ok) {
+                                    if (UpdateOptions.debug) logger.info("[DEBUG] Download failed for " + entry.getKey());
+                                    else logger.info("Download for " + entry.getKey() + " was not successful");
+                                }
+                            });
+                        } catch (RejectedExecutionException stopped) {
+                            if (collector != null) collector.recordIfAbsent(entry.getKey(), EntryResult.FAILED);
+                        }
+                    }
+                    ex.shutdown();
                 }
-            }
-            if (listener != null) {
-                listener.onComplete(updateApplied.get());
+
+                while (!ex.isTerminated()) {
+                    try {
+                        ex.awaitTermination(1, TimeUnit.DAYS);
+                    } catch (InterruptedException interruption) {
+                        interrupted = true;
+                        cancelRequested.set(true);
+                        ex.shutdownNow();
+                    }
+                }
+            } catch (Throwable coordinatorFailure) {
+                logger.log(Level.WARNING, "Update run coordinator failed", coordinatorFailure);
+                if (ex != null) {
+                    ex.shutdownNow();
+                    while (!ex.isTerminated()) {
+                        try {
+                            ex.awaitTermination(1, TimeUnit.MINUTES);
+                        } catch (InterruptedException interruption) {
+                            interrupted = true;
+                        }
+                    }
+                }
+            } finally {
+                if (timeoutExecutor != null) timeoutExecutor.shutdownNow();
+                if (collector != null && cancelRequested.get()) {
+                    for (String name : orderedLinks.keySet()) {
+                        collector.recordIfAbsent(name, EntryResult.FAILED);
+                    }
+                }
+                boolean applied = updateApplied.get();
+                RunSummary summary = collector != null ? collector.snapshot(pendingUpdates.size()) : null;
+                pluginDownloader.setInstallListener(null);
+                // Host semaphore sizes are configuration-derived. Recreate them between runs so
+                // a reload can safely apply maxPerHost without changing permits mid-transfer.
+                UpdateOptions.hostSemaphores.clear();
+                currentExecutor = null;
+                cancelRequested.set(false);
+                updating.set(false);
+
+                try {
+                    if (summary != null) {
+                        if (runListener != null) runListener.onComplete(summary);
+                        else if (mode == ExecutionMode.CHECK) logCheckSummary(summary);
+                    }
+                    if (listener != null) listener.onComplete(applied);
+                } catch (Throwable callbackFailure) {
+                    logger.log(Level.WARNING, "Update completion callback failed", callbackFailure);
+                }
+                if (interrupted) Thread.currentThread().interrupt();
             }
         });
     }
@@ -396,6 +592,7 @@ public class PluginUpdater {
             return false;
         }
         cancelRequested.set(true);
+        pluginDownloader.cancelInFlightDownloads();
         ExecutorService ex = currentExecutor;
         if (ex != null) {
             try {
@@ -434,10 +631,15 @@ public class PluginUpdater {
     }
 
     private void markUpdateApplied() {
-        updateApplied.set(true);
+        if (!currentEntryCancelled()) {
+            updateApplied.set(true);
+        }
     }
 
     private void recordStatus(String pluginName, EntryResult result) {
+        if (currentEntryCancelled()) {
+            return;
+        }
         RunCollector collector = runCollector.get();
         if (collector != null) {
             collector.record(pluginName, result);
@@ -466,13 +668,36 @@ public class PluginUpdater {
     }
 
     private void recordPendingUpdate(String pluginName, String source, String customPath) {
+        recordPendingUpdate(pluginName, source, customPath, null, null, null);
+    }
+
+    private boolean currentEntryCancelled() {
+        return cancelRequested.get() || Thread.currentThread().isInterrupted();
+    }
+
+    private void recordPendingUpdate(String pluginName, String source, String customPath,
+                                     String provider, String remoteVersion, String changelog) {
+        recordPendingUpdate(pluginName, source, customPath, provider, remoteVersion,
+                changelog, null, null);
+    }
+
+    private void recordPendingUpdate(String pluginName, String source, String customPath,
+                                     String provider, String remoteVersion, String changelog,
+                                     String actionUrl, String manualReason) {
+        if (currentEntryCancelled()) {
+            return;
+        }
         String resolvedSource = (source == null || source.trim().isEmpty()) ? "unknown" : source.trim();
         Path target = pluginDownloader.resolveInstallTargetPath(pluginName, customPath);
-        pendingUpdates.put(pluginName, new PendingUpdate(pluginName, resolvedSource, target.toAbsolutePath().normalize().toString(), System.currentTimeMillis()));
-        markUpdateApplied();
+        pendingUpdates.put(pluginName, new PendingUpdate(pluginName, resolvedSource,
+                target.toAbsolutePath().normalize().toString(), System.currentTimeMillis(),
+                provider, remoteVersion, changelog, actionUrl, manualReason));
     }
 
     private void clearPendingUpdate(String pluginName) {
+        if (currentEntryCancelled()) {
+            return;
+        }
         if (pluginName == null || pluginName.trim().isEmpty()) {
             return;
         }
@@ -497,7 +722,7 @@ public class PluginUpdater {
     }
 
     private boolean handleCheckResult(String pluginName, String source, String customPath, PluginDownloader.CheckResult result) {
-        if (result == null) {
+        if (result == null || currentEntryCancelled()) {
             return false;
         }
         if (result == PluginDownloader.CheckResult.AVAILABLE) {
@@ -514,39 +739,161 @@ public class PluginUpdater {
     }
 
     private boolean handleRemoteTransfer(String link, String key, Map.Entry<String, String> entry, String customPath) throws IOException {
-        if (currentExecutionMode() == ExecutionMode.CHECK) {
-            return handleCheckResult(entry.getKey(), link, customPath, pluginDownloader.checkRemotePlugin(link, entry.getKey(), key, customPath));
+        boolean installMode = currentExecutionMode() == ExecutionMode.INSTALL;
+        Path target = pluginDownloader.resolveInstallTargetPath(entry.getKey(), customPath);
+        Path live = pluginDownloader.resolveLivePluginPath(entry.getKey(), customPath);
+        Path existing = live != null && Files.isRegularFile(live) ? live : target;
+        JarMetadata before = readJarMetadata(existing);
+        ResolvedUpdate generic = ResolvedUpdate.builder(entry.getKey(), inferProvider(link), link)
+                .normalizedSource(link)
+                .build();
+        EntryOptions transferOptions = EntryOptions.parse(entry.getValue(), logger);
+        TransferOutcome outcome = pluginDownloader.transferRemotePluginDetailedWithPolicy(
+                link, entry.getKey(), key, customPath, installMode, transferOptions);
+        if (currentEntryCancelled()) {
+            return false;
         }
-        boolean ok = pluginDownloader.downloadPlugin(link, entry.getKey(), key, customPath);
-        if (ok) {
-            clearPendingUpdate(entry.getKey());
-            recordStatus(entry.getKey(), EntryResult.APPLIED);
+        switch (outcome.status) {
+            case AVAILABLE:
+                recordPendingUpdate(entry.getKey(), link, customPath, generic.provider,
+                        outcome.after == null ? null : outcome.after.version, null);
+                recordStatus(entry.getKey(), EntryResult.AVAILABLE);
+                historyLogger.log(historyEvent(UpdateEvent.Type.AVAILABLE, entry.getKey(), generic,
+                        before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case UNCHANGED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.SKIPPED, entry.getKey(), generic,
+                        before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case BLOCKED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.BLOCKED, entry.getKey(), generic,
+                        before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case APPLIED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.APPLIED);
+                markUpdateApplied();
+                historyLogger.log(historyEvent(UpdateEvent.Type.APPLIED, entry.getKey(), generic,
+                        before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            default:
+                recordStatus(entry.getKey(), EntryResult.FAILED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.FAILED, entry.getKey(), generic,
+                        before, outcome.after, outcome.targetPath, outcome.reason));
+                return false;
         }
-        return ok;
     }
 
-    private boolean handleJenkinsTransfer(String link, Map.Entry<String, String> entry, String customPath) {
-        if (currentExecutionMode() == ExecutionMode.CHECK) {
-            return handleCheckResult(entry.getKey(), link, customPath, pluginDownloader.checkJenkinsPlugin(link, entry.getKey(), customPath));
+    private String inferProvider(String link) {
+        String value = link == null ? "" : link.toLowerCase(Locale.ROOT);
+        if (value.contains("github")) return "github";
+        if (value.contains("gitlab")) return "gitlab";
+        if (value.contains("modrinth")) return "modrinth";
+        if (value.contains("hangar.papermc")) return "hangar";
+        if (value.contains("spigotmc") || value.contains("spiget")) return "spigot";
+        if (value.contains("jenkins") || value.contains("/job/")) return "jenkins";
+        if (value.contains("curseforge")) return "curseforge";
+        if (value.contains("minebbs")) return "minebbs";
+        if (value.contains("blob.build")) return "blob";
+        if (value.contains("guizhanss")) return "guizhanss";
+        return "direct";
+    }
+
+    private boolean handleJenkinsTransfer(String link, Map.Entry<String, String> entry,
+                                          String customPath, EntryOptions options) {
+        boolean installMode = currentExecutionMode() == ExecutionMode.INSTALL;
+        TransferOutcome outcome = pluginDownloader.transferJenkinsPluginDetailed(
+                link, entry.getKey(), customPath, installMode, options);
+        if (currentEntryCancelled()) {
+            return false;
         }
-        boolean ok = pluginDownloader.downloadJenkinsPlugin(link, entry.getKey(), customPath);
-        if (ok) {
-            clearPendingUpdate(entry.getKey());
-            recordStatus(entry.getKey(), EntryResult.APPLIED);
+        ResolvedUpdate resolved = ResolvedUpdate.builder(entry.getKey(), "jenkins", link)
+                .normalizedSource(link)
+                .versionLabel(outcome.after == null ? null : outcome.after.version)
+                .build();
+        switch (outcome.status) {
+            case AVAILABLE:
+                recordPendingUpdate(entry.getKey(), link, customPath, "jenkins", resolved.versionLabel, null);
+                recordStatus(entry.getKey(), EntryResult.AVAILABLE);
+                historyLogger.log(historyEvent(UpdateEvent.Type.AVAILABLE, entry.getKey(), resolved,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case UNCHANGED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.SKIPPED, entry.getKey(), resolved,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case BLOCKED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.BLOCKED, entry.getKey(), resolved,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case APPLIED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.APPLIED);
+                markUpdateApplied();
+                historyLogger.log(historyEvent(UpdateEvent.Type.APPLIED, entry.getKey(), resolved,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            default:
+                recordStatus(entry.getKey(), EntryResult.FAILED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.FAILED, entry.getKey(), resolved,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return false;
         }
-        return ok;
     }
 
     private boolean handleBuiltRepoTransfer(String repoPath, String key, Map.Entry<String, String> entry, String customPath, String branchOverride, String sourceLabel) throws IOException {
-        if (currentExecutionMode() == ExecutionMode.CHECK) {
-            return handleCheckResult(entry.getKey(), sourceLabel, customPath, pluginDownloader.checkBuildFromGitHubRepo(repoPath, entry.getKey(), key, customPath, branchOverride));
+        EntryOptions buildOptions = EntryOptions.parse(entry.getValue(), logger);
+        boolean installMode = currentExecutionMode() == ExecutionMode.INSTALL;
+        TransferOutcome outcome = pluginDownloader.buildFromGitHubRepoDetailed(repoPath,
+                entry.getKey(), key, customPath, branchOverride, installMode, buildOptions);
+        if (currentEntryCancelled()) {
+            return false;
         }
-        boolean ok = pluginDownloader.buildFromGitHubRepo(repoPath, entry.getKey(), key, customPath, branchOverride);
-        if (ok) {
-            clearPendingUpdate(entry.getKey());
-            recordStatus(entry.getKey(), EntryResult.APPLIED);
+        ResolvedUpdate sourceBuild = ResolvedUpdate.builder(entry.getKey(), "github-source", sourceLabel)
+                .normalizedSource(sourceLabel)
+                .versionLabel(outcome.after == null ? null : outcome.after.version)
+                .build();
+        switch (outcome.status) {
+            case AVAILABLE:
+                recordPendingUpdate(entry.getKey(), sourceLabel, customPath,
+                        sourceBuild.provider, sourceBuild.versionLabel, null);
+                recordStatus(entry.getKey(), EntryResult.AVAILABLE);
+                historyLogger.log(historyEvent(UpdateEvent.Type.AVAILABLE, entry.getKey(), sourceBuild,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case UNCHANGED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.SKIPPED, entry.getKey(), sourceBuild,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case BLOCKED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.BLOCKED, entry.getKey(), sourceBuild,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case APPLIED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.APPLIED);
+                markUpdateApplied();
+                historyLogger.log(historyEvent(UpdateEvent.Type.APPLIED, entry.getKey(), sourceBuild,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            default:
+                recordStatus(entry.getKey(), EntryResult.FAILED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.FAILED, entry.getKey(), sourceBuild,
+                        outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                return false;
         }
-        return ok;
     }
 
     private boolean isScriptSource(String value) {
@@ -673,20 +1020,8 @@ public class PluginUpdater {
             return false;
         }
 
-        try {
-            if (currentExecutionMode() == ExecutionMode.CHECK) {
-                return handleCheckResult(pluginName, jarPath.toString(), customPath, pluginDownloader.checkLocalFile(jarPath, pluginName, customPath));
-            }
-            boolean ok = pluginDownloader.installLocalFile(jarPath, pluginName, customPath);
-            if (ok) {
-                clearPendingUpdate(pluginName);
-                recordStatus(pluginName, EntryResult.APPLIED);
-            }
-            return ok;
-        } catch (IOException e) {
-            logger.info("Failed to install script output for " + pluginName + ": " + e.getMessage());
-            return false;
-        }
+        return handleLocalFile(jarPath,
+                new AbstractMap.SimpleEntry<String, String>(pluginName, jarPath.toString()), customPath);
     }
 
     private List<String> buildScriptCommand(List<String> tokens, Path scriptPath) {
@@ -855,15 +1190,39 @@ public class PluginUpdater {
             return false;
         }
         try {
-            if (currentExecutionMode() == ExecutionMode.CHECK) {
-                return handleCheckResult(entry.getKey(), localPath.toString(), customPath, pluginDownloader.checkLocalFile(localPath, entry.getKey(), customPath));
+            boolean installMode = currentExecutionMode() == ExecutionMode.INSTALL;
+            TransferOutcome outcome = pluginDownloader.installLocalFileDetailed(
+                    localPath, entry.getKey(), customPath, installMode);
+            ResolvedUpdate resolved = ResolvedUpdate.builder(entry.getKey(), "local", localPath.toString())
+                    .normalizedSource(localPath.toAbsolutePath().normalize().toString())
+                    .versionLabel(outcome.after == null ? null : outcome.after.version)
+                    .build();
+            switch (outcome.status) {
+                case AVAILABLE:
+                    recordPendingUpdate(entry.getKey(), localPath.toString(), customPath, "local", resolved.versionLabel, null);
+                    recordStatus(entry.getKey(), EntryResult.AVAILABLE);
+                    historyLogger.log(historyEvent(UpdateEvent.Type.AVAILABLE, entry.getKey(), resolved,
+                            outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                    return true;
+                case UNCHANGED:
+                    clearPendingUpdate(entry.getKey());
+                    recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                    historyLogger.log(historyEvent(UpdateEvent.Type.SKIPPED, entry.getKey(), resolved,
+                            outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                    return true;
+                case APPLIED:
+                    clearPendingUpdate(entry.getKey());
+                    recordStatus(entry.getKey(), EntryResult.APPLIED);
+                    markUpdateApplied();
+                    historyLogger.log(historyEvent(UpdateEvent.Type.APPLIED, entry.getKey(), resolved,
+                            outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                    return true;
+                default:
+                    recordStatus(entry.getKey(), EntryResult.FAILED);
+                    historyLogger.log(historyEvent(UpdateEvent.Type.FAILED, entry.getKey(), resolved,
+                            outcome.before, outcome.after, outcome.targetPath, outcome.reason));
+                    return false;
             }
-            boolean ok = pluginDownloader.installLocalFile(localPath, entry.getKey(), customPath);
-            if (ok) {
-                clearPendingUpdate(entry.getKey());
-                recordStatus(entry.getKey(), EntryResult.APPLIED);
-            }
-            return ok;
         } catch (IOException e) {
             logger.info("Failed to install local file for " + entry.getKey() + ": " + e.getMessage());
             return false;
@@ -943,20 +1302,18 @@ public class PluginUpdater {
 
     private boolean handleUpdateEntry(String platform, String key, Map.Entry<String, String> entry) throws IOException {
         try {
-            logger.info(entry.getKey() + " ---- " + entry.getValue());
-            String rawValue = ListEntryLoader.normalizeValue(entry.getValue());
-            String customPath = null;
-            String linkPart = rawValue;
-            int pipe = rawValue != null ? rawValue.indexOf('|') : -1;
-            if (pipe >= 0) {
-                linkPart = rawValue.substring(0, pipe).trim();
-                String tail = rawValue.substring(pipe + 1).trim();
-                if (!tail.isEmpty()) customPath = tail;
+            if (currentEntryCancelled()) {
+                return false;
             }
-            String value = linkPart != null ? linkPart.trim() : "";
+            EntryOptions options = EntryOptions.parse(entry.getValue(), logger);
+            logger.info(entry.getKey() + " ---- " + redactSourceForLog(options.sourceWithoutQuery));
+            String customPath = options.customPath();
+            String value = options.sourceValue != null ? options.sourceValue.trim() : "";
             if (value.isEmpty()) {
                 return false;
             }
+
+            ServerEnvironment environment = ServerEnvironment.of(platform);
 
             if (isScriptSource(value)) {
                 return handleScriptSource(value, entry, customPath);
@@ -979,12 +1336,18 @@ public class PluginUpdater {
                 return handleSpigotDownload(entryKey, entry, value);
             } else if (value.contains("github.com")) {
                 return handleGitHubDownload(platform, entryKey, entry, value);
-            } else if (value.contains("https://ci.")) {
-                return handleJenkinsDownload(key, entry, value);
+            } else if (value.contains("gitlab.com")) {
+                return handleGitLabResolved(environment, entry, options);
+            } else if (looksLikeJenkins(value)) {
+                return handleJenkinsResolved(environment, key, entry, options);
             } else if (value.contains("modrinth.com")) {
-                return handleModrinthDownload(platform, entryKey, entry, value);
+                return handleModrinthResolved(environment, entryKey, entry, options);
             } else if (value.contains("https://hangar.papermc.io/")) {
-                return handleHangarDownload(platform, entryKey, entry, value);
+                return handleHangarResolved(environment, entryKey, entry, options);
+            } else if (ExtendedClipProvider.recognizes(value)) {
+                return handleExtendedClipResolved(environment, entryKey, entry, options);
+            } else if (VoxelShopProvider.recognizes(value)) {
+                return handleVoxelShopResolved(environment, entry, options);
             } else if (value.contains("builds.guizhanss.com")) {
                 return handleGuizhanssDownload(value, entryKey, entry);
             } else if (value.contains("minebbs.com")) {
@@ -992,9 +1355,26 @@ public class PluginUpdater {
             } else if (value.contains("curseforge.com")) {
                 return handleCurseForgeDownload(value, entryKey, entry);
             } else {
+                if (UpdateOptions.cacheDirectUrlHeadMetadata && isHttpUrl(value)) {
+                    try {
+                        ResolvedUpdate resolved = directUrlProvider.resolve(entry.getKey(), value);
+                        if (resolved != null) {
+                            return applyResolvedUpdate(resolved, options, entry, entryKey,
+                                    environment, customPath);
+                        }
+                    } catch (IOException metadataError) {
+                        if (UpdateOptions.debug) {
+                            logger.info("[DEBUG] Direct URL HEAD metadata unavailable for "
+                                    + entry.getKey() + ": " + metadataError.getMessage());
+                        }
+                    }
+                }
                 try {
                     if (handleRemoteTransfer(value, entryKey, entry, customPath)) return true;
                 } catch (IOException ignored) {
+                }
+                if (currentEntryCancelled()) {
+                    return false;
                 }
                 return handleGenericPageDownload(value, entryKey, entry);
             }
@@ -1112,6 +1492,599 @@ public class PluginUpdater {
             return false;
         }
 
+    }
+
+    static String redactSourceForLog(String source) {
+        if (source == null) return "";
+        String trimmed = source.trim();
+        try {
+            java.net.URI uri = new java.net.URI(trimmed);
+            if (uri.getScheme() != null && uri.getHost() != null) {
+                return new java.net.URI(uri.getScheme(), null, uri.getHost(), uri.getPort(),
+                        uri.getPath(), null, null).toASCIIString();
+            }
+        } catch (Exception ignored) {
+        }
+        return trimmed.replaceFirst("(://)[^/@\\s]+@", "$1<redacted>@");
+    }
+
+    private static boolean isHttpUrl(String value) {
+        if (value == null) return false;
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return normalized.startsWith("http://") || normalized.startsWith("https://");
+    }
+
+    private boolean handleModrinthResolved(ServerEnvironment environment, String key,
+                                           Map.Entry<String, String> entry, EntryOptions options) {
+        try {
+            return applyResolvedUpdate(modrinthProvider.resolve(entry.getKey(), options, environment),
+                    options, entry, key, environment, null);
+        } catch (CompatibilityException blocked) {
+            return providerCompatibilityBlocked(entry, "modrinth", blocked);
+        } catch (IOException ex) {
+            return providerResolutionFailed(entry, "modrinth", ex);
+        }
+    }
+
+    private boolean handleHangarResolved(ServerEnvironment environment, String key,
+                                         Map.Entry<String, String> entry, EntryOptions options) {
+        try {
+            return applyResolvedUpdate(hangarProvider.resolve(entry.getKey(), options, environment),
+                    options, entry, key, environment, null);
+        } catch (CompatibilityException blocked) {
+            return providerCompatibilityBlocked(entry, "hangar", blocked);
+        } catch (IOException ex) {
+            return providerResolutionFailed(entry, "hangar", ex);
+        }
+    }
+
+    private boolean handleExtendedClipResolved(ServerEnvironment environment, String key,
+                                               Map.Entry<String, String> entry, EntryOptions options) {
+        try {
+            String defaultPath = options.customPath();
+            if (defaultPath == null) {
+                defaultPath = "filePath=plugins/PlaceholderAPI/expansions|useUpdateFolder=false";
+            }
+            return applyResolvedUpdate(extendedClipProvider.resolve(entry.getKey(), options),
+                    options, entry, key, environment, defaultPath);
+        } catch (IOException ex) {
+            return providerResolutionFailed(entry, "extendedclip", ex);
+        }
+    }
+
+    private boolean handleGitLabResolved(ServerEnvironment environment,
+                                         Map.Entry<String, String> entry, EntryOptions options) {
+        String token = resolveGitLabToken(options);
+        try {
+            Map<String, String> headers = token == null
+                    ? Collections.<String, String>emptyMap()
+                    : Collections.singletonMap("PRIVATE-TOKEN", token);
+            return applyResolvedUpdate(gitLabProvider.resolve(entry.getKey(), options, token),
+                    options, entry, null, environment, null, headers);
+        } catch (IOException ex) {
+            return providerResolutionFailed(entry, "gitlab", ex);
+        }
+    }
+
+    private boolean handleVoxelShopResolved(ServerEnvironment environment,
+                                            Map.Entry<String, String> entry,
+                                            EntryOptions options) {
+        try {
+            VoxelShopProvider.Resolution resolution = voxelShopProvider.resolve(
+                    entry.getKey(), options, resolveVoxelShopToken(options));
+            if (resolution.isDownloadable()) {
+                return applyResolvedUpdate(resolution.update, options, entry, null,
+                        environment, null);
+            }
+            return handleManualProviderUpdate(resolution, options, entry);
+        } catch (IOException ex) {
+            return providerResolutionFailed(entry, "voxelshop", ex);
+        }
+    }
+
+    private boolean handleManualProviderUpdate(VoxelShopProvider.Resolution resolution,
+                                               EntryOptions options,
+                                               Map.Entry<String, String> entry) {
+        if (currentEntryCancelled()) {
+            return false;
+        }
+        ResolvedUpdate resolved = resolution.update;
+        String customPath = options.customPath();
+        Path target = pluginDownloader.resolveInstallTargetPath(entry.getKey(), customPath);
+        Path live = pluginDownloader.resolveLivePluginPath(entry.getKey(), customPath);
+        Path existing = live != null && Files.isRegularFile(live) ? live : target;
+        JarMetadata local = readJarMetadata(existing);
+        boolean force = options.bool("force", false);
+        if (!force && Files.isRegularFile(existing)) {
+            VersionPolicy policy = VersionPolicy.from(options);
+            VersionDecision decision = policy.evaluate(local == null ? null : local.version,
+                    resolved.versionLabel, true);
+            if (!decision.allowed) {
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.BLOCKED, entry.getKey(), resolved,
+                        local, null, existing, "versionPolicy "
+                                + policy.name().toLowerCase(Locale.ROOT) + ": " + decision.reason));
+                return true;
+            }
+        }
+        String effectiveChangelog = aggregateChangelogRange(
+                local == null ? null : local.version, resolved);
+        recordPendingUpdate(entry.getKey(), options.sourceValue, customPath,
+                resolved.provider, resolved.versionLabel, effectiveChangelog,
+                resolution.actionUrl, resolution.reason);
+        recordStatus(entry.getKey(), EntryResult.AVAILABLE);
+        historyLogger.log(historyEvent(UpdateEvent.Type.AVAILABLE, entry.getKey(), resolved,
+                local, null, target, reasonWithChangelog(
+                        "manual action required: " + resolution.reason, effectiveChangelog)));
+        logAvailableChangelog(entry.getKey(), resolved.versionLabel, effectiveChangelog);
+        logger.info("Update available for " + entry.getKey() + "; manual download required at "
+                + resolution.actionUrl);
+        return true;
+    }
+
+    private String resolveVoxelShopToken(EntryOptions options) {
+        String account = options == null ? null : options.first("account");
+        if (account == null || account.trim().isEmpty()) account = "default";
+        String token = UpdateOptions.voxelShopTokens.get(account);
+        if (token == null) token = UpdateOptions.voxelShopTokens.get(account.toLowerCase(Locale.ROOT));
+        return token == null || token.trim().isEmpty() ? null : token.trim();
+    }
+
+    private boolean handleJenkinsResolved(ServerEnvironment environment, String key,
+                                          Map.Entry<String, String> entry, EntryOptions options) {
+        try {
+            return applyResolvedUpdate(jenkinsProvider.resolve(entry.getKey(), options, null, null),
+                    options, entry, null, environment, null);
+        } catch (IOException resolutionError) {
+            if (UpdateOptions.debug) {
+                logger.info("[DEBUG] Jenkins metadata resolver failed for " + entry.getKey()
+                        + ": " + resolutionError.getMessage() + "; trying legacy fallback.");
+            }
+            try {
+                if (handleJenkinsDownload(key, entry, options)) {
+                    return true;
+                }
+            } catch (RuntimeException fallbackError) {
+                if (UpdateOptions.debug) {
+                    logger.info("[DEBUG] Jenkins legacy fallback failed for " + entry.getKey()
+                            + ": " + fallbackError.getMessage());
+                }
+            }
+            return providerResolutionFailed(entry, "jenkins", resolutionError);
+        }
+    }
+
+    private static boolean looksLikeJenkins(String value) {
+        if (value == null) return false;
+        String normalized = value.trim().toLowerCase(Locale.ROOT);
+        return (normalized.startsWith("http://") || normalized.startsWith("https://"))
+                && normalized.contains("/job/");
+    }
+
+    private boolean providerResolutionFailed(Map.Entry<String, String> entry, String provider, Exception error) {
+        if (currentEntryCancelled()) {
+            return false;
+        }
+        String reason = error == null || error.getMessage() == null ? "provider metadata resolution failed" : error.getMessage();
+        logger.info("Failed to resolve " + provider + " update for " + entry.getKey() + ": " + reason);
+        recordStatus(entry.getKey(), EntryResult.FAILED);
+        historyLogger.log(UpdateEvent.builder(UpdateEvent.Type.FAILED, entry.getKey())
+                .provider(provider)
+                .reason(reason)
+                .build());
+        return false;
+    }
+
+    private boolean providerCompatibilityBlocked(Map.Entry<String, String> entry,
+                                                  String provider,
+                                                  CompatibilityException blocked) {
+        if (currentEntryCancelled()) {
+            return false;
+        }
+        String reason = blocked == null || blocked.getMessage() == null
+                ? "no provider release matches this server environment" : blocked.getMessage();
+        clearPendingUpdate(entry.getKey());
+        recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+        historyLogger.log(UpdateEvent.builder(UpdateEvent.Type.BLOCKED, entry.getKey())
+                .provider(provider)
+                .reason(reason)
+                .build());
+        logger.info("Blocked " + provider + " update for " + entry.getKey() + ": " + reason);
+        return true;
+    }
+
+    private boolean applyResolvedUpdate(ResolvedUpdate resolved,
+                                        EntryOptions options,
+                                        Map.Entry<String, String> entry,
+                                        String key,
+                                        ServerEnvironment environment,
+                                        String customPathOverride) throws IOException {
+        return applyResolvedUpdate(resolved, options, entry, key, environment, customPathOverride,
+                Collections.<String, String>emptyMap());
+    }
+
+    private boolean applyResolvedUpdate(ResolvedUpdate resolved,
+                                        EntryOptions options,
+                                        Map.Entry<String, String> entry,
+                                        String key,
+                                        ServerEnvironment environment,
+                                        String customPathOverride,
+                                        Map<String, String> requestHeaders) throws IOException {
+        if (currentEntryCancelled()) {
+            return false;
+        }
+        if (resolved == null || resolved.downloadUrl == null || resolved.downloadUrl.trim().isEmpty()) {
+            return providerResolutionFailed(entry, resolved == null ? "unknown" : resolved.provider,
+                    new IOException("provider returned no download URL"));
+        }
+
+        String customPath = customPathOverride != null ? customPathOverride : options.customPath();
+        Path target = pluginDownloader.resolveInstallTargetPath(entry.getKey(), customPath);
+        Path live = pluginDownloader.resolveLivePluginPath(entry.getKey(), customPath);
+        Path existing = live != null && Files.isRegularFile(live) ? live : target;
+        Path cacheTarget = target != null && Files.isRegularFile(target) ? target : existing;
+        JarMetadata local = readJarMetadata(existing);
+        String effectiveChangelog = aggregateChangelogRange(
+                local == null ? null : local.version, resolved);
+        String metadataId = resolved.metadataId();
+        String cacheKey = resolved.cacheKey(entry.getKey(), options);
+        UpdateMetadataCache.CacheEntry cached = metadataCache.get(cacheKey);
+        boolean force = options.bool("force", false);
+        // Provider metadata is resolved afresh before this method on every run, so
+        // refreshCache does not bypass an unchanged-payload cache hit.
+        boolean refreshCache = options.bool("refreshCache", false);
+        if (refreshCache && UpdateOptions.debug) {
+            logger.info("[DEBUG] Refreshed provider metadata for " + entry.getKey());
+        }
+        boolean cacheEnabled = UpdateOptions.metadataCacheEnabled;
+        if (options.has("cache")) cacheEnabled = options.bool("cache", cacheEnabled);
+        if (options.has("metadataCache")) cacheEnabled = options.bool("metadataCache", cacheEnabled);
+
+        boolean metadataChanged = cached == null || metadataId == null || !metadataId.equals(cached.metadataId);
+        if (!force && Files.isRegularFile(existing)) {
+            VersionPolicy policy = VersionPolicy.from(options);
+            VersionDecision decision = policy.evaluate(
+                    local == null ? null : local.version, resolved.versionLabel, metadataChanged);
+            // A matching provider version may still need a payload comparison when the cache is
+            // absent, stale, explicitly refreshed, or invalidated by an external file change.
+            boolean deferUnchangedVersion = !decision.allowed
+                    && "version is unchanged".equals(decision.reason)
+                    && !metadataChanged;
+            if (!decision.allowed && !deferUnchangedVersion) {
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.BLOCKED, entry.getKey(), resolved, local, null,
+                        existing, "versionPolicy " + policy.name().toLowerCase(Locale.ROOT)
+                                + ": " + decision.reason));
+                if (UpdateOptions.debug) {
+                    logger.info("[DEBUG] Blocked " + entry.getKey() + " " + value(local == null ? null : local.version)
+                            + " -> " + value(resolved.versionLabel) + ": " + decision.reason);
+                }
+                return true;
+            }
+        }
+
+        boolean sameTarget = cached == null || cached.targetPath == null
+                || samePath(cached.targetPath, cacheTarget == null ? null : cacheTarget.toString());
+        if (cacheEnabled && sameTarget
+                && metadataCache.shouldSkip(cacheKey, metadataId, cacheTarget,
+                cacheEnabled, force, false)) {
+            clearPendingUpdate(entry.getKey());
+            recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+            historyLogger.log(historyEvent(UpdateEvent.Type.SKIPPED, entry.getKey(), resolved, local, null,
+                    cacheTarget, "metadata unchanged"));
+            if (UpdateOptions.debug) {
+                logger.info("[DEBUG] Skipping payload for " + entry.getKey() + ": provider metadata is unchanged.");
+            }
+            return true;
+        }
+
+        boolean installMode = currentExecutionMode() == ExecutionMode.INSTALL;
+        TransferOutcome outcome = pluginDownloader.transferRemotePluginDetailed(
+                resolved.downloadUrl, entry.getKey(), key, customPath, installMode, resolved, requestHeaders);
+        if (currentEntryCancelled()) {
+            return false;
+        }
+        switch (outcome.status) {
+            case AVAILABLE:
+                recordPendingUpdate(entry.getKey(), options.sourceValue, customPath,
+                        resolved.provider, resolved.versionLabel, effectiveChangelog);
+                recordStatus(entry.getKey(), EntryResult.AVAILABLE);
+                historyLogger.log(historyEvent(UpdateEvent.Type.AVAILABLE, entry.getKey(), resolved, local,
+                        outcome.after, outcome.targetPath, reasonWithChangelog(outcome.reason, effectiveChangelog)));
+                logAvailableChangelog(entry.getKey(), resolved.versionLabel, effectiveChangelog);
+                return true;
+            case UNCHANGED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.UNCHANGED);
+                writeMetadataCache(cacheEnabled, cacheKey, resolved, environment, outcome, existing, false);
+                historyLogger.log(historyEvent(UpdateEvent.Type.SKIPPED, entry.getKey(), resolved, local,
+                        outcome.after, outcome.targetPath, outcome.reason));
+                return true;
+            case APPLIED:
+                clearPendingUpdate(entry.getKey());
+                recordStatus(entry.getKey(), EntryResult.APPLIED);
+                markUpdateApplied();
+                writeMetadataCache(cacheEnabled, cacheKey, resolved, environment, outcome, outcome.targetPath, true);
+                historyLogger.log(historyEvent(UpdateEvent.Type.APPLIED, entry.getKey(), resolved, local,
+                        outcome.after, outcome.targetPath, reasonWithChangelog(outcome.reason, effectiveChangelog)));
+                logAvailableChangelog(entry.getKey(), resolved.versionLabel, effectiveChangelog);
+                return true;
+            default:
+                recordStatus(entry.getKey(), EntryResult.FAILED);
+                historyLogger.log(historyEvent(UpdateEvent.Type.FAILED, entry.getKey(), resolved, local,
+                        outcome.after, outcome.targetPath, outcome.reason));
+                return false;
+        }
+    }
+
+    private void writeMetadataCache(boolean enabled, String cacheKey, ResolvedUpdate resolved,
+                                    ServerEnvironment environment, TransferOutcome outcome,
+                                    Path target, boolean installed) {
+        if (!enabled || resolved.metadataId() == null) return;
+        UpdateMetadataCache.CacheEntry cacheEntry = new UpdateMetadataCache.CacheEntry(
+                resolved.pluginName, resolved.provider, resolved.normalizedSource, resolved.metadataId(),
+                resolved.versionLabel, target == null ? null : target.toAbsolutePath().normalize().toString());
+        cacheEntry.releaseType = resolved.releaseType;
+        cacheEntry.fileName = resolved.fileName;
+        cacheEntry.minecraftVersion = environment == null ? null : environment.minecraftVersion;
+        cacheEntry.loader = resolved.platform;
+        cacheEntry.checkedAt = Instant.now().toString();
+        if (installed) cacheEntry.installedAt = cacheEntry.checkedAt;
+        cacheEntry.setHash("sha1", firstNonNull(resolved.sha1,
+                outcome.after == null ? null : outcome.after.sha1));
+        cacheEntry.setHash("sha256", firstNonNull(resolved.sha256,
+                outcome.after == null ? null : outcome.after.sha256));
+        cacheEntry.setHash("sha512", resolved.sha512);
+        cacheEntry.setHash("md5", firstNonNull(resolved.md5,
+                outcome.after == null ? null : outcome.after.md5));
+        metadataCache.put(cacheKey, cacheEntry);
+        metadataCache.save();
+    }
+
+    private UpdateEvent historyEvent(UpdateEvent.Type type, String pluginName, ResolvedUpdate resolved,
+                                     JarMetadata before, JarMetadata after, Path target, String reason) {
+        String newVersion = resolved.versionLabel;
+        if ((newVersion == null || newVersion.trim().isEmpty()) && after != null) newVersion = after.version;
+        // History labels these values as SHA-1, so only emit comparable SHA-1 digests.
+        String newHash = after != null ? after.sha1 : resolved.sha1;
+        String oldHash = newHash == null || before == null ? null : before.sha1;
+        return UpdateEvent.builder(type, pluginName)
+                .provider(resolved.provider)
+                .versions(before == null ? null : before.version, newVersion)
+                .hashes(oldHash, newHash)
+                .targetPath(target == null ? null : target.toAbsolutePath().normalize().toString())
+                .metadataId(resolved.metadataId())
+                .reason(reason)
+                .build();
+    }
+
+    private JarMetadata readJarMetadata(Path path) {
+        if (path == null || !Files.isRegularFile(path)) return null;
+        try {
+            return JarMetadata.read(path);
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    private void logAvailableChangelog(String pluginName, String versionLabel, String changelog) {
+        if (changelog == null || changelog.trim().isEmpty()) return;
+        String normalized = changelog.replace('\r', '\n');
+        String[] lines = normalized.split("\\n+");
+        logger.info("Changelog for " + pluginName
+                + (versionLabel == null ? "" : " " + versionLabel) + ":");
+        int emitted = 0;
+        int characters = 0;
+        for (String line : lines) {
+            String clean = line.trim();
+            if (clean.isEmpty()) continue;
+            if (clean.length() > 240) clean = clean.substring(0, 237) + "...";
+            logger.info(" - " + clean);
+            emitted++;
+            characters += clean.length();
+            if (emitted >= 12 || characters >= 1800) {
+                logger.info(" - (changelog truncated; see the provider page for the remainder)");
+                break;
+            }
+        }
+    }
+
+    static String aggregateChangelogRange(String installedVersion, ResolvedUpdate resolved) {
+        if (resolved == null) return null;
+        String fallback = cleanChangelog(resolved.changelog);
+        LooseVersion installed = LooseVersion.parse(installedVersion);
+        LooseVersion selected = LooseVersion.parse(resolved.versionLabel);
+        if (!installed.known || !selected.known || selected.compareTo(installed) <= 0
+                || resolved.releaseNotes == null || resolved.releaseNotes.isEmpty()) {
+            return fallback;
+        }
+
+        List<ResolvedUpdate.ReleaseNote> deduplicated = deduplicateReleaseNotes(resolved.releaseNotes);
+        LinkedHashMap<String, ResolvedUpdate.ReleaseNote> byVersion =
+                new LinkedHashMap<String, ResolvedUpdate.ReleaseNote>();
+        for (ResolvedUpdate.ReleaseNote note : deduplicated) {
+            if (note == null) continue;
+            LooseVersion version = LooseVersion.parse(note.versionLabel);
+            if (!version.known || version.compareTo(installed) <= 0
+                    || version.compareTo(selected) > 0) {
+                continue;
+            }
+            String canonicalVersion = version.toString();
+            ResolvedUpdate.ReleaseNote current = byVersion.get(canonicalVersion);
+            if (current == null || preferReleaseNote(note, current, resolved.versionId)) {
+                byVersion.put(canonicalVersion, note);
+            }
+        }
+        if (byVersion.isEmpty()) return fallback;
+
+        List<ResolvedUpdate.ReleaseNote> range =
+                new ArrayList<ResolvedUpdate.ReleaseNote>(byVersion.values());
+        Collections.sort(range, new Comparator<ResolvedUpdate.ReleaseNote>() {
+            @Override
+            public int compare(ResolvedUpdate.ReleaseNote left,
+                               ResolvedUpdate.ReleaseNote right) {
+                int byVersion = LooseVersion.parse(left.versionLabel)
+                        .compareTo(LooseVersion.parse(right.versionLabel));
+                if (byVersion != 0) return byVersion;
+                int byTime = Long.compare(left.publishedAtMillis, right.publishedAtMillis);
+                if (byTime != 0) return byTime;
+                return safeText(left.versionId).compareTo(safeText(right.versionId));
+            }
+        });
+
+        ResolvedUpdate.ReleaseNote selectedNote = null;
+        for (ResolvedUpdate.ReleaseNote note : range) {
+            if (LooseVersion.parse(note.versionLabel).compareTo(selected) == 0) {
+                selectedNote = note;
+                break;
+            }
+        }
+        if (selectedNote == null) return fallback;
+
+        List<String> rendered = new ArrayList<String>();
+        for (ResolvedUpdate.ReleaseNote note : range) {
+            boolean isSelected = note == selectedNote;
+            String body = cleanChangelog(note.changelog);
+            if (body == null && isSelected) body = fallback;
+            body = compactChangelog(body, MAX_CHANGELOG_NOTE_CHARACTERS);
+            if (body == null) continue;
+            String label = compactChangelog(note.versionLabel, 80);
+            rendered.add("[" + (label == null ? "unknown" : label) + "] " + body);
+        }
+        if (rendered.isEmpty()) return fallback;
+
+        List<String> includedNewestFirst = new ArrayList<String>();
+        for (int index = rendered.size() - 1;
+             index >= 0 && includedNewestFirst.size() < MAX_CHANGELOG_RANGE_NOTES;
+             index--) {
+            String candidate = rendered.get(index);
+            int prospectiveCount = includedNewestFirst.size() + 1;
+            int omitted = rendered.size() - prospectiveCount;
+            int length = rangeHeader(omitted, !resolved.releaseNotesComplete).length();
+            for (String included : includedNewestFirst) length += included.length() + 1;
+            length += candidate.length() + (length == 0 ? 0 : 1);
+            if (length > MAX_CHANGELOG_RANGE_CHARACTERS) break;
+            includedNewestFirst.add(candidate);
+        }
+        if (includedNewestFirst.isEmpty()) return fallback;
+
+        Collections.reverse(includedNewestFirst);
+        int omitted = rendered.size() - includedNewestFirst.size();
+        StringBuilder aggregated = new StringBuilder();
+        aggregated.append(rangeHeader(omitted, !resolved.releaseNotesComplete));
+        for (String note : includedNewestFirst) {
+            if (aggregated.length() > 0) aggregated.append('\n');
+            aggregated.append(note);
+        }
+        return aggregated.toString();
+    }
+
+    private static List<ResolvedUpdate.ReleaseNote> deduplicateReleaseNotes(
+            List<ResolvedUpdate.ReleaseNote> notes) {
+        List<ResolvedUpdate.ReleaseNote> result = new ArrayList<ResolvedUpdate.ReleaseNote>();
+        LinkedHashMap<String, Integer> providerIds = new LinkedHashMap<String, Integer>();
+        for (ResolvedUpdate.ReleaseNote note : notes) {
+            if (note == null || note.versionId == null) {
+                if (note != null) result.add(note);
+                continue;
+            }
+            Integer index = providerIds.get(note.versionId);
+            if (index == null) {
+                providerIds.put(note.versionId, result.size());
+                result.add(note);
+            } else if (cleanChangelog(result.get(index).changelog) == null
+                    && cleanChangelog(note.changelog) != null) {
+                result.set(index, note);
+            }
+        }
+        return result;
+    }
+
+    private static boolean preferReleaseNote(ResolvedUpdate.ReleaseNote candidate,
+                                             ResolvedUpdate.ReleaseNote current,
+                                             String selectedVersionId) {
+        boolean candidateSelected = selectedVersionId != null
+                && selectedVersionId.equals(candidate.versionId);
+        boolean currentSelected = selectedVersionId != null
+                && selectedVersionId.equals(current.versionId);
+        if (candidateSelected != currentSelected) return candidateSelected;
+        if (candidate.publishedAtMillis != current.publishedAtMillis) {
+            return candidate.publishedAtMillis > current.publishedAtMillis;
+        }
+        int byId = safeText(candidate.versionId).compareTo(safeText(current.versionId));
+        if (byId != 0) return byId > 0;
+        int byLabel = safeText(candidate.versionLabel).compareTo(safeText(current.versionLabel));
+        if (byLabel != 0) return byLabel > 0;
+        return safeText(candidate.changelog).compareTo(safeText(current.changelog)) > 0;
+    }
+
+    private static String rangeHeader(int omitted, boolean incomplete) {
+        StringBuilder header = new StringBuilder();
+        if (omitted > 0) {
+            header.append('(').append(omitted).append(" earlier release note")
+                    .append(omitted == 1 ? "" : "s").append(" omitted)");
+        }
+        if (incomplete) {
+            if (header.length() > 0) header.append('\n');
+            header.append("(older release history may be incomplete)");
+        }
+        return header.toString();
+    }
+
+    private static String cleanChangelog(String value) {
+        if (value == null) return null;
+        String clean = value.trim();
+        return clean.isEmpty() ? null : clean;
+    }
+
+    private static String compactChangelog(String value, int maxCharacters) {
+        String clean = cleanChangelog(value);
+        if (clean == null) return null;
+        clean = clean.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ');
+        while (clean.contains("  ")) clean = clean.replace("  ", " ");
+        return clean.length() <= maxCharacters
+                ? clean : clean.substring(0, Math.max(0, maxCharacters - 3)) + "...";
+    }
+
+    private static String safeText(String value) {
+        return value == null ? "" : value;
+    }
+
+    private String reasonWithChangelog(String reason, String changelog) {
+        if (changelog == null || changelog.trim().isEmpty()) return reason;
+        String summary = changelog.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ').trim();
+        while (summary.contains("  ")) summary = summary.replace("  ", " ");
+        if (summary.length() > 420) summary = summary.substring(0, 417) + "...";
+        return (reason == null || reason.trim().isEmpty() ? "" : reason.trim() + "; ")
+                + "changelog: " + summary;
+    }
+
+    private boolean samePath(String left, String right) {
+        if (left == null || right == null) return false;
+        try {
+            Path a = Paths.get(left).toAbsolutePath().normalize();
+            Path b = Paths.get(right).toAbsolutePath().normalize();
+            return isWindows() ? a.toString().equalsIgnoreCase(b.toString()) : a.equals(b);
+        } catch (RuntimeException ignored) {
+            return left.equals(right);
+        }
+    }
+
+    private static String value(String value) {
+        return value == null || value.trim().isEmpty() ? "unknown" : value;
+    }
+
+    private String resolveGitLabToken(EntryOptions options) {
+        String account = options == null ? null : options.first("account", "author");
+        String token = null;
+        if (account != null) {
+            token = UpdateOptions.gitlabTokens.get(account);
+            if (token == null) token = UpdateOptions.gitlabTokens.get(account.toLowerCase(Locale.ROOT));
+        }
+        if (token == null) token = UpdateOptions.gitlabTokens.get("default");
+        return token == null || token.trim().isEmpty() ? null : token.trim();
     }
 
     private boolean handleHangarDownload(String platform, String key, Map.Entry<String, String> entry, String value) {
@@ -2070,7 +3043,10 @@ public class PluginUpdater {
         }
     }
 
-    private boolean handleJenkinsDownload(String key, Map.Entry<String, String> entry, String value) {
+    private boolean handleJenkinsDownload(String key, Map.Entry<String, String> entry,
+                                          EntryOptions options) {
+
+        String value = options.sourceValue;
 
         String jenkinsLink;
         int artifactNum = 1;
@@ -2096,7 +3072,7 @@ public class PluginUpdater {
         try {
             node = new ObjectMapper().readTree(new URL(jenkinsLink + "lastSuccessfulBuild/api/json"));
         } catch (IOException e) {
-            return handleAlternateJenkinsDownload(key, entry, jenkinsLink);
+            return handleAlternateJenkinsDownload(key, entry, jenkinsLink, options);
         }
 
         ArrayNode artifacts = (ArrayNode) node.get("artifacts");
@@ -2145,6 +3121,7 @@ public class PluginUpdater {
     }
 
     private boolean handleGitHubDownload(String platform, String key, Map.Entry<String, String> entry, String value) {
+        String sourceBuildUrl = value;
         value = value.replace("/actions/", "/dev").replace("/actions", "/dev");
         if (value.contains("/dev")) {
             return handleGitHubDevDownload(platform, key, entry, value);
@@ -2152,8 +3129,43 @@ public class PluginUpdater {
 
         String repoPath = null;
         boolean forceBuild = false;
-        String sourceBuildUrl = value;
         try {
+            EntryOptions githubOptions = EntryOptions.parse(entry.getValue(), logger);
+            forceBuild = githubOptions.bool("autobuild", githubOptions.bool("auto", false));
+            try {
+                repoPath = "/" + GitHubProvider.extractRepository(githubOptions.sourceWithoutQuery);
+            } catch (IOException ignored) {
+                // The legacy parser below retains support for historical URL forms.
+            }
+
+            if (!forceBuild) {
+                try {
+                    ResolvedUpdate resolved = gitHubProvider.resolve(entry.getKey(), githubOptions, key);
+                    Map<String, String> assetHeaders = Collections.emptyMap();
+                    if (key != null && !key.trim().isEmpty()) {
+                        assetHeaders = new LinkedHashMap<String, String>();
+                        assetHeaders.put("Authorization", "Bearer " + key.trim());
+                        assetHeaders.put("Accept", "application/octet-stream");
+                        assetHeaders.put("X-GitHub-Api-Version", "2022-11-28");
+                    }
+                    boolean handled = applyResolvedUpdate(resolved, githubOptions, entry, key,
+                            ServerEnvironment.of(platform), null, assetHeaders);
+                    if (handled) {
+                        return true;
+                    }
+                    if (UpdateOptions.debug) {
+                        logger.info("[DEBUG] GitHub release transfer failed for " + resolved.projectId
+                                + " - attempting source build fallback.");
+                    }
+                    return attemptSourceBuild(repoPath, entry, sourceBuildUrl, key, false, false);
+                } catch (IOException providerError) {
+                    if (UpdateOptions.debug) {
+                        logger.info("[DEBUG] GitHub release metadata was unavailable for " + entry.getKey()
+                                + ": " + providerError.getMessage() + "; trying legacy/source fallback.");
+                    }
+                }
+            }
+
             String query = null;
             int qIdx = value.indexOf('?');
             if (qIdx != -1) {
@@ -2161,7 +3173,7 @@ public class PluginUpdater {
                 value = value.substring(0, qIdx);
             }
 
-            forceBuild = Boolean.parseBoolean(queryParam(query, "autobuild"));
+            forceBuild = forceBuild || Boolean.parseBoolean(queryParam(query, "autobuild"));
 
             int artifactNum = 1;
             int lb = value.indexOf('['), rb = value.indexOf(']', lb + 1);
@@ -2434,11 +3446,12 @@ public class PluginUpdater {
         }
     }
 
-    private boolean handleAlternateJenkinsDownload(String key, Map.Entry<String, String> entry, String value) {
+    private boolean handleAlternateJenkinsDownload(String key, Map.Entry<String, String> entry,
+                                                   String value, EntryOptions options) {
         try {
             String downloadUrl = value + "lastSuccessfulBuild/artifact/*zip*/archive.zip";
             String cp = extractCustomPath(entry.getValue());
-            return handleJenkinsTransfer(downloadUrl, entry, cp);
+            return handleJenkinsTransfer(downloadUrl, entry, cp, options);
         } catch (Exception e) {
             logger.info("Failed to download plugin from jenkins, " + value + " , are you sure link is correct and in right format?" + e.getMessage());
             return false;
@@ -2539,31 +3552,6 @@ public class PluginUpdater {
         }
         String cp = extractCustomPath(entry.getValue());
         String branchOverride = extractGitHubBranch(url);
-        if (currentExecutionMode() == ExecutionMode.CHECK) {
-            if (repoPath == null || repoPath.isEmpty()) return false;
-            try {
-                return handleBuiltRepoTransfer(repoPath, key, entry, cp, branchOverride, url);
-            } catch (IOException e) {
-                if (UpdateOptions.debug) {
-                    logger.info("[DEBUG] Source build check failed for " + repoPath + ": " + e.getMessage());
-                }
-                return false;
-            }
-        }
-        try {
-            Path out = pluginDownloader.resolveInstallTargetPath(entry.getKey(), cp);
-            try {
-                Files.createDirectories(out.getParent());
-            } catch (Exception ignored) {
-            }
-            if (GitHubBuild.handleGitHubBuild(logger, url, out, key)) {
-                clearPendingUpdate(entry.getKey());
-                markUpdateApplied();
-                recordStatus(entry.getKey(), EntryResult.APPLIED);
-                return true;
-            }
-        } catch (Throwable ignored) {
-        }
         if (repoPath == null || repoPath.isEmpty()) return false;
         try {
             return handleBuiltRepoTransfer(repoPath, key, entry, cp, branchOverride, url);

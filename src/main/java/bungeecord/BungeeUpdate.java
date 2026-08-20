@@ -34,7 +34,6 @@ public final class BungeeUpdate extends Plugin {
     @Override
     public void onEnable() {
         new Metrics(this, 18456);
-        pluginUpdater = new PluginUpdater(this.getLogger());
 
         cfgMgr = new ConfigManager(getDataFolder(), "config.yml");
         generateOrUpdateConfig();
@@ -42,6 +41,7 @@ public final class BungeeUpdate extends Plugin {
         applyHttpConfigFromCfg();
         applyBehaviorConfig();
         UpdateOptions.useUpdateFolder = cfgMgr.getBoolean("behavior.useUpdateFolder");
+        pluginUpdater = new PluginUpdater(this.getLogger(), getDataFolder().toPath());
         configureRollback();
         File dataFolder = getDataFolder();
         myFile = new File(dataFolder, "list.yml");
@@ -77,12 +77,13 @@ public final class BungeeUpdate extends Plugin {
     }
 
     private void reloadPluginConfig() {
-        this.cfgMgr = new ConfigManager(getDataFolder(), "config.yml");
+        this.cfgMgr.reloadConfig();
         generateOrUpdateConfig();
         handleUpdateFolder();
         applyHttpConfigFromCfg();
         applyBehaviorConfig();
         UpdateOptions.useUpdateFolder = cfgMgr.getBoolean("behavior.useUpdateFolder");
+        pluginUpdater.reloadPersistence();
         configureRollback();
         getLogger().info("AutoUpdatePlugins configuration reloaded.");
     }
@@ -307,7 +308,9 @@ public final class BungeeUpdate extends Plugin {
                 HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
                 HttpsURLConnection.setDefaultHostnameVerifier((h, s) -> true);
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable configError) {
+            getLogger().log(java.util.logging.Level.WARNING,
+                    "Failed to apply AutoUpdatePlugins HTTP configuration", configError);
         }
     }
 
@@ -414,7 +417,9 @@ public final class BungeeUpdate extends Plugin {
                 HttpsURLConnection.setDefaultSSLSocketFactory(sc.getSocketFactory());
                 HttpsURLConnection.setDefaultHostnameVerifier((h, s) -> true);
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable configError) {
+            getLogger().log(java.util.logging.Level.WARNING,
+                    "Failed to apply AutoUpdatePlugins HTTP configuration", configError);
         }
     }
 
@@ -450,11 +455,51 @@ public final class BungeeUpdate extends Plugin {
             UpdateOptions.backoffBaseMs = Math.max(0, cfgMgr.getInt("performance.backoffBaseMs"));
             UpdateOptions.backoffMaxMs = Math.max(UpdateOptions.backoffBaseMs, cfgMgr.getInt("performance.backoffMaxMs"));
             UpdateOptions.maxPerHost = Math.max(1, cfgMgr.getInt("performance.maxPerHost"));
+            if (pluginUpdater == null || !pluginUpdater.isUpdating()) UpdateOptions.hostSemaphores.clear();
             UpdateOptions.rollbackEnabled = cfgMgr.getBoolean("rollback.enabled");
             UpdateOptions.restartAfterRollback = cfgMgr.contains("rollback.restartAfterRollback")
                     ? cfgMgr.getBoolean("rollback.restartAfterRollback")
                     : true;
             UpdateOptions.rollbackMaxCopies = Math.max(0, cfgMgr.getInt("rollback.maxBackups"));
+
+            UpdateOptions.metadataCacheEnabled = cfgMgr.getBoolean("metadata.enabled");
+            String metadataFile = cfgMgr.getString("metadata.file");
+            UpdateOptions.metadataCacheFile = metadataFile == null || metadataFile.trim().isEmpty()
+                    ? "metadata.json" : metadataFile.trim();
+            UpdateOptions.metadataCacheTtlMinutes = Math.max(0, cfgMgr.getInt("metadata.ttlMinutes"));
+            UpdateOptions.skipDownloadWhenMetadataUnchanged = cfgMgr.getBoolean("metadata.skipDownloadWhenUnchanged");
+            UpdateOptions.cacheDirectUrlHeadMetadata = cfgMgr.getBoolean("metadata.directUrlHeadMetadata");
+            String configuredMinecraftVersion = cfgMgr.getString("metadata.minecraftVersion");
+            UpdateOptions.serverMinecraftVersion = configuredMinecraftVersion == null
+                    ? "" : configuredMinecraftVersion.trim();
+
+            UpdateOptions.modrinthMinecraftVersionCheck = cfgMgr.getBoolean("compatibility.modrinthMinecraftVersionCheck");
+            UpdateOptions.hangarMinecraftVersionCheck = cfgMgr.getBoolean("compatibility.hangarMinecraftVersionCheck");
+            UpdateOptions.strictMinecraftVersionMetadata = cfgMgr.getBoolean("compatibility.strictMinecraftVersionMetadata");
+            if (UpdateOptions.debug && UpdateOptions.serverMinecraftVersion.isEmpty()
+                    && (UpdateOptions.modrinthMinecraftVersionCheck || UpdateOptions.hangarMinecraftVersionCheck)) {
+                getLogger().info("[DEBUG] Minecraft compatibility filtering is enabled, but proxies cannot infer the backend version; set metadata.minecraftVersion.");
+            }
+
+            String versionPolicy = cfgMgr.getString("versioning.policy");
+            UpdateOptions.versionPolicyDefault = versionPolicy == null || versionPolicy.trim().isEmpty()
+                    ? "any" : versionPolicy.trim();
+            String unknownVersionPolicy = cfgMgr.getString("versioning.unknownVersionPolicy");
+            UpdateOptions.unknownVersionPolicy = unknownVersionPolicy == null || unknownVersionPolicy.trim().isEmpty()
+                    ? "allow" : unknownVersionPolicy.trim();
+            UpdateOptions.allowSameVersionSnapshotUpdates = cfgMgr.getBoolean("versioning.allowSameVersionSnapshotUpdates");
+            UpdateOptions.allowSameVersionReleaseHashUpdates = cfgMgr.getBoolean("versioning.allowSameVersionReleaseHashUpdates");
+
+            UpdateOptions.updateLogEnabled = cfgMgr.getBoolean("logging.updates.enabled");
+            String logPath = cfgMgr.getString("logging.updates.path");
+            UpdateOptions.updateLogPath = logPath == null || logPath.trim().isEmpty() ? "logs" : logPath.trim();
+            String logPattern = cfgMgr.getString("logging.updates.filePattern");
+            UpdateOptions.updateLogFilePattern = logPattern == null || logPattern.trim().isEmpty()
+                    ? "yyyy-MM-dd'.log'" : logPattern.trim();
+            UpdateOptions.updateLogCommandPageSize = Math.max(1, cfgMgr.getInt("logging.updates.commandPageSize"));
+            UpdateOptions.updateLogIncludeUnchanged = cfgMgr.getBoolean("logging.updates.includeUnchanged");
+            UpdateOptions.updateLogIncludeChecks = cfgMgr.getBoolean("logging.updates.includeChecks");
+
             UpdateOptions.githubTokens.clear();
             Map<String, Object> tokenSection = cfgMgr.getSection("updates.githubTokens");
             if (tokenSection != null) {
@@ -465,6 +510,34 @@ public final class BungeeUpdate extends Plugin {
                             String account = tokenEntry.getKey().trim();
                             UpdateOptions.githubTokens.put(account, token);
                             UpdateOptions.githubTokens.put(account.toLowerCase(Locale.ROOT), token);
+                        }
+                    }
+                }
+            }
+            UpdateOptions.gitlabTokens.clear();
+            Map<String, Object> gitlabTokenSection = cfgMgr.getSection("updates.gitlabTokens");
+            if (gitlabTokenSection != null) {
+                for (Map.Entry<String, Object> tokenEntry : gitlabTokenSection.entrySet()) {
+                    if (tokenEntry.getKey() != null && tokenEntry.getValue() != null) {
+                        String token = tokenEntry.getValue().toString().trim();
+                        if (!token.isEmpty()) {
+                            String account = tokenEntry.getKey().trim();
+                            UpdateOptions.gitlabTokens.put(account, token);
+                            UpdateOptions.gitlabTokens.put(account.toLowerCase(Locale.ROOT), token);
+                        }
+                    }
+                }
+            }
+            UpdateOptions.voxelShopTokens.clear();
+            Map<String, Object> voxelTokenSection = cfgMgr.getSection("updates.voxelShopTokens");
+            if (voxelTokenSection != null) {
+                for (Map.Entry<String, Object> tokenEntry : voxelTokenSection.entrySet()) {
+                    if (tokenEntry.getKey() != null && tokenEntry.getValue() != null) {
+                        String token = tokenEntry.getValue().toString().trim();
+                        if (!token.isEmpty()) {
+                            String account = tokenEntry.getKey().trim();
+                            UpdateOptions.voxelShopTokens.put(account, token);
+                            UpdateOptions.voxelShopTokens.put(account.toLowerCase(Locale.ROOT), token);
                         }
                     }
                 }
@@ -485,7 +558,9 @@ public final class BungeeUpdate extends Plugin {
                     if (o != null) UpdateOptions.rollbackFilters.add(o.toString());
                 }
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable configError) {
+            getLogger().log(java.util.logging.Level.WARNING,
+                    "Failed to apply AutoUpdatePlugins behavior configuration", configError);
         }
     }
 
@@ -496,6 +571,8 @@ public final class BungeeUpdate extends Plugin {
         cfgMgr.addDefault("updates.schedule.timezone", "UTC", "The timezone for the cron schedule.");
         cfgMgr.addDefault("updates.key", "", "GitHub token for Actions/authenticated requests (optional)");
         cfgMgr.addDefault("updates.githubTokens", new LinkedHashMap<String, String>(), "Optional named GitHub tokens. Select one per entry with ?account=name.");
+        cfgMgr.addDefault("updates.gitlabTokens", new LinkedHashMap<String, String>(), "Optional named GitLab PRIVATE-TOKEN values. Select one per entry with ?account=name.");
+        cfgMgr.addDefault("updates.voxelShopTokens", new LinkedHashMap<String, String>(), "Optional named VoxelShop user tokens. Select one per entry with ?account=name.");
 
         cfgMgr.addDefault("http.userAgent", "AutoUpdatePlugins", "HTTP User-Agent override (leave blank to auto-rotate)");
         cfgMgr.addDefault("http.headers", new ArrayList<>(), "Extra headers: list of {name, value}");
@@ -529,6 +606,29 @@ public final class BungeeUpdate extends Plugin {
         cfgMgr.addDefault("behavior.restartMessage", "Server restarting to apply updates.", "Broadcast message before restarting (supports {delay}).");
         cfgMgr.addDefault("behavior.preRestartCommand", "", "Console command to run when restart is scheduled (optional).");
         cfgMgr.addDefault("behavior.restartCommands", new ArrayList<>(), "Timed pre-restart actions: list of {timeToRestart, command, message}.");
+
+        cfgMgr.addDefault("metadata.enabled", true, "Cache lightweight provider metadata to avoid unchanged artifact downloads.");
+        cfgMgr.addDefault("metadata.file", "metadata.json", "Metadata cache file, relative to the plugin data folder unless absolute.");
+        cfgMgr.addDefault("metadata.ttlMinutes", 0, "Metadata cache lifetime in minutes (0 keeps entries until provider metadata changes).");
+        cfgMgr.addDefault("metadata.skipDownloadWhenUnchanged", true, "Skip payload downloads when provider metadata and the target jar are unchanged.");
+        cfgMgr.addDefault("metadata.directUrlHeadMetadata", false, "Use HTTP HEAD metadata for direct URLs when the origin supports it.");
+        cfgMgr.addDefault("metadata.minecraftVersion", "", "Backend Minecraft version override; proxies do not guess this value.");
+
+        cfgMgr.addDefault("compatibility.modrinthMinecraftVersionCheck", true, "Require Modrinth releases compatible with the configured Minecraft version.");
+        cfgMgr.addDefault("compatibility.hangarMinecraftVersionCheck", true, "Require Hangar releases compatible with the configured Minecraft version.");
+        cfgMgr.addDefault("compatibility.strictMinecraftVersionMetadata", false, "Reject provider releases whose Minecraft compatibility is unknown.");
+
+        cfgMgr.addDefault("versioning.policy", "any", "Default version policy: any, patch, same-major, or none.");
+        cfgMgr.addDefault("versioning.unknownVersionPolicy", "allow", "Whether updates with unparseable versions are allowed or blocked.");
+        cfgMgr.addDefault("versioning.allowSameVersionSnapshotUpdates", true, "Allow same-version snapshot builds when their metadata or hash changes.");
+        cfgMgr.addDefault("versioning.allowSameVersionReleaseHashUpdates", false, "Allow same-version release builds when their hash changes.");
+
+        cfgMgr.addDefault("logging.updates.enabled", true, "Write update decisions to daily history files.");
+        cfgMgr.addDefault("logging.updates.path", "logs", "Update history directory, relative to the plugin data folder unless absolute.");
+        cfgMgr.addDefault("logging.updates.filePattern", "yyyy-MM-dd'.log'", "Java date pattern used for daily update history file names.");
+        cfgMgr.addDefault("logging.updates.commandPageSize", 8, "Number of update history entries shown by /baup log.");
+        cfgMgr.addDefault("logging.updates.includeUnchanged", false, "Include ordinary duplicate/unchanged payload decisions in update history.");
+        cfgMgr.addDefault("logging.updates.includeChecks", true, "Include available updates found by check-only runs in update history.");
 
 
         cfgMgr.addDefault("paths.tempPath", "", "Custom temp/cache path (optional)");

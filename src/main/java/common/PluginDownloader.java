@@ -31,6 +31,7 @@ import java.security.SecureRandom;
 import java.security.cert.X509Certificate;
 import java.util.*;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.jar.JarFile;
 import java.util.logging.Logger;
 import java.util.stream.Collectors;
@@ -42,6 +43,11 @@ import java.util.zip.ZipInputStream;
 
 public class PluginDownloader {
 
+    static final int DEADLINE_ACTIVE = 0;
+    static final int DEADLINE_TIMED_OUT = 1;
+    static final int DEADLINE_COMMIT_CLAIMED = 2;
+    static final int DEADLINE_FINISHED = 3;
+
     private static final ObjectMapper JSON_MAPPER = new ObjectMapper();
 
     public enum CheckResult {
@@ -52,6 +58,7 @@ public class PluginDownloader {
 
     private enum TransferResult {
         APPLIED,
+        BLOCKED,
         UNCHANGED,
         FAILED
     }
@@ -67,6 +74,9 @@ public class PluginDownloader {
     private static volatile PoolingHttpClientConnectionManager connMgr = null;
     private static Boolean java11HttpAvailable = null;
     private volatile InstallListener installListener;
+    private final ThreadLocal<JarMetadata> transferCandidate = new ThreadLocal<>();
+    private final ThreadLocal<String> transferBlockReason = new ThreadLocal<>();
+    private final ThreadLocal<AtomicInteger> transferDeadline = new ThreadLocal<>();
 
     public PluginDownloader(Logger logger) {
         this.logger = logger;
@@ -74,6 +84,24 @@ public class PluginDownloader {
 
     public void setInstallListener(InstallListener listener) {
         this.installListener = listener;
+    }
+
+    void bindTransferDeadline(AtomicInteger state) {
+        if (state == null) transferDeadline.remove();
+        else transferDeadline.set(state);
+    }
+
+    void clearTransferDeadline() {
+        transferDeadline.remove();
+    }
+
+    private boolean claimInstallCommit() {
+        if (Thread.currentThread().isInterrupted()) return false;
+        AtomicInteger state = transferDeadline.get();
+        if (state == null) return true;
+        int current = state.get();
+        return current == DEADLINE_COMMIT_CLAIMED
+                || state.compareAndSet(DEADLINE_ACTIVE, DEADLINE_COMMIT_CLAIMED);
     }
 
     private void backoffDelay(int attempt, int code, String link) {
@@ -90,9 +118,10 @@ public class PluginDownloader {
         }
     }
 
-    public static void setHttpHeaders(Map<String, String> headers, String userAgent) {
+    public static synchronized void setHttpHeaders(Map<String, String> headers, String userAgent) {
         extraHeaders = headers != null ? new HashMap<>(headers) : new HashMap<>();
         overrideUserAgent = (userAgent != null && !userAgent.trim().isEmpty()) ? userAgent.trim() : null;
+        resetPooledClient();
     }
 
     public static Map<String, String> getExtraHeaders() {
@@ -133,6 +162,7 @@ public class PluginDownloader {
             HttpClientBuilder builder = HttpClients.custom()
                     .setDefaultRequestConfig(rc)
                     .setConnectionManager(connMgr)
+                    .disableAutomaticRetries()
                     .disableContentCompression();
 
             if (!UpdateOptions.sslVerify) {
@@ -166,31 +196,166 @@ public class PluginDownloader {
         return downloadPlugin(link, fileName, githubToken, null);
     }
 
+    /** Abort current Apache transfers and rebuild the pool with current HTTP settings on demand. */
+    public void cancelInFlightDownloads() {
+        resetPooledClient();
+    }
+
+    private static void resetPooledClient() {
+        synchronized (PluginDownloader.class) {
+            CloseableHttpClient client = pooledClient;
+            PoolingHttpClientConnectionManager manager = connMgr;
+            pooledClient = null;
+            connMgr = null;
+            if (client != null) {
+                try {
+                    client.close();
+                } catch (IOException ignored) {
+                }
+            }
+            if (manager != null) {
+                try {
+                    manager.shutdown();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
     public boolean downloadPlugin(String link, String fileName, String githubToken, String customPath) throws IOException {
-        return transferRemotePlugin(link, fileName, githubToken, customPath, true) != TransferResult.FAILED;
+        return transferRemotePluginDetailed(link, fileName, githubToken, customPath, true).handled();
     }
 
     public CheckResult checkRemotePlugin(String link, String fileName, String githubToken, String customPath) throws IOException {
-        return mapCheckResult(transferRemotePlugin(link, fileName, githubToken, customPath, false));
+        TransferOutcome outcome = transferRemotePluginDetailed(link, fileName, githubToken, customPath, false);
+        if (outcome.status == TransferOutcome.Status.AVAILABLE) return CheckResult.AVAILABLE;
+        if (outcome.status == TransferOutcome.Status.UNCHANGED) return CheckResult.UNCHANGED;
+        return CheckResult.FAILED;
     }
 
     public Path resolveInstallTargetPath(String fileName, String customPath) {
         return resolveInstallPaths(fileName, customPath).targetPath;
     }
 
-    private TransferResult transferRemotePlugin(String link, String fileName, String githubToken, String customPath, boolean installMode) throws IOException {
+    public Path resolveLivePluginPath(String fileName, String customPath) {
+        InstallPaths paths = resolveInstallPaths(fileName, customPath);
+        return paths.livePath != null ? paths.livePath : paths.targetPath;
+    }
+
+    public TransferOutcome transferRemotePluginDetailed(String link,
+                                                         String fileName,
+                                                         String githubToken,
+                                                         String customPath,
+                                                         boolean installMode) throws IOException {
+        return transferRemotePluginDetailed(link, fileName, githubToken, customPath, installMode, null);
+    }
+
+    public TransferOutcome transferRemotePluginDetailed(String link,
+                                                         String fileName,
+                                                         String githubToken,
+                                                         String customPath,
+                                                         boolean installMode,
+                                                         ResolvedUpdate expected) throws IOException {
+        return transferRemotePluginDetailed(link, fileName, githubToken, customPath, installMode,
+                expected, Collections.<String, String>emptyMap());
+    }
+
+    public TransferOutcome transferRemotePluginDetailed(String link,
+                                                         String fileName,
+                                                         String githubToken,
+                                                         String customPath,
+                                                         boolean installMode,
+                                                         ResolvedUpdate expected,
+                                                         Map<String, String> requestHeaders) throws IOException {
+        return transferRemotePluginDetailedInternal(link, fileName, githubToken, customPath,
+                installMode, expected, requestHeaders, null);
+    }
+
+    TransferOutcome transferRemotePluginDetailedWithPolicy(String link,
+                                                            String fileName,
+                                                            String githubToken,
+                                                            String customPath,
+                                                            boolean installMode,
+                                                            EntryOptions entryOptions) throws IOException {
+        return transferRemotePluginDetailedInternal(link, fileName, githubToken, customPath,
+                installMode, null, Collections.<String, String>emptyMap(), entryOptions);
+    }
+
+    private TransferOutcome transferRemotePluginDetailedInternal(String link,
+                                                                  String fileName,
+                                                                  String githubToken,
+                                                                  String customPath,
+                                                                  boolean installMode,
+                                                                  ResolvedUpdate expected,
+                                                                  Map<String, String> requestHeaders,
+                                                                  EntryOptions entryOptions) throws IOException {
+        InstallPaths paths = resolveInstallPaths(fileName, customPath);
+        Path existing = paths.livePath != null && Files.isRegularFile(paths.livePath) ? paths.livePath : paths.targetPath;
+        JarMetadata before = readMetadata(existing);
+        transferCandidate.remove();
+        transferBlockReason.remove();
+        TransferResult result = transferRemotePlugin(link, fileName, githubToken, customPath,
+                installMode, expected, requestHeaders, entryOptions);
+        TransferOutcome.Status status;
+        String reason;
+        if (result == TransferResult.UNCHANGED) {
+            status = TransferOutcome.Status.UNCHANGED;
+            reason = "payload matches installed jar";
+        } else if (result == TransferResult.BLOCKED) {
+            status = TransferOutcome.Status.BLOCKED;
+            reason = transferBlockReason.get();
+            if (reason == null) reason = "blocked by version policy";
+        } else if (result == TransferResult.APPLIED && installMode) {
+            status = TransferOutcome.Status.APPLIED;
+            reason = "installed";
+        } else if (result == TransferResult.APPLIED) {
+            status = TransferOutcome.Status.AVAILABLE;
+            reason = "payload differs from installed jar";
+        } else {
+            status = TransferOutcome.Status.FAILED;
+            reason = "download, validation, or install failed";
+        }
+        JarMetadata after = status == TransferOutcome.Status.APPLIED
+                ? readMetadata(paths.targetPath) : transferCandidate.get();
+        transferCandidate.remove();
+        transferBlockReason.remove();
+        return new TransferOutcome(status, fileName, paths.targetPath, paths.livePath,
+                before, after, reason);
+    }
+
+    private JarMetadata readMetadata(Path path) {
+        if (path == null || !Files.isRegularFile(path)) return null;
+        try {
+            return JarMetadata.read(path);
+        } catch (IOException ignored) {
+            return null;
+        }
+    }
+
+    private TransferResult transferRemotePlugin(String link, String fileName, String githubToken, String customPath,
+                                                boolean installMode, ResolvedUpdate expected,
+                                                Map<String, String> requestHeaders,
+                                                EntryOptions entryOptions) throws IOException {
+        if (Thread.currentThread().isInterrupted()) {
+            return TransferResult.FAILED;
+        }
         String host = null;
         Semaphore hostSem = null;
+        boolean hostPermitAcquired = false;
         try {
-            try {
-                host = new URL(link).getHost();
-            } catch (Throwable ignored) {
-            }
-            if (host != null) {
-                hostSem = UpdateOptions.hostSemaphores.computeIfAbsent(host.toLowerCase(Locale.ROOT), h -> new Semaphore(Math.max(1, UpdateOptions.maxPerHost)));
-                hostSem.acquireUninterruptibly();
-            }
+            host = new URL(link).getHost();
         } catch (Throwable ignored) {
+        }
+        if (host != null) {
+            hostSem = UpdateOptions.hostSemaphores.computeIfAbsent(host.toLowerCase(Locale.ROOT),
+                    h -> new Semaphore(Math.max(1, UpdateOptions.maxPerHost)));
+            try {
+                hostSem.acquire();
+                hostPermitAcquired = true;
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return TransferResult.FAILED;
+            }
         }
         boolean requiresAuth = link.toLowerCase().contains("actions")
                 && link.toLowerCase().contains("github")
@@ -204,30 +369,47 @@ public class PluginDownloader {
 
         try {
             for (int attempt = 1; attempt <= Math.max(2, UpdateOptions.maxRetries); attempt++) {
+                if (Thread.currentThread().isInterrupted()) {
+                    return TransferResult.FAILED;
+                }
                 File rawTmp = new File(rawTempPath);
                 File outTmp = new File(outputTempPath);
                 cleanupQuietly(rawTmp);
                 cleanupQuietly(outTmp);
                 try {
                     boolean downloaded = false;
-                    if (hasJava11HttpClient()) {
-                        downloaded = downloadWithJava11(link, githubToken, requiresAuth, rawTmp, attempt);
+                    if (requestHeaders != null && !requestHeaders.isEmpty()) {
+                        downloaded = downloadWithScopedHeaders(link, githubToken, requiresAuth,
+                                rawTmp, attempt, fileName, requestHeaders);
+                    } else if (hasJava11HttpClient()) {
+                        downloaded = downloadWithJava11(link, githubToken, requiresAuth, rawTmp, attempt, requestHeaders);
                     } else {
-                        downloaded = downloadWithApache(link, githubToken, requiresAuth, rawTmp, attempt);
+                        downloaded = downloadWithApache(link, githubToken, requiresAuth, rawTmp, attempt, requestHeaders);
                     }
 
-                    if (!downloaded) {
-                        downloaded = downloadWithUrlConnection(link, githubToken, requiresAuth, rawTmp, attempt, fileName);
+                    if (Thread.currentThread().isInterrupted()) {
+                        return TransferResult.FAILED;
+                    }
+                    if (!downloaded && (requestHeaders == null || requestHeaders.isEmpty())) {
+                        downloaded = downloadWithUrlConnection(link, githubToken, requiresAuth, rawTmp, attempt,
+                                fileName, requestHeaders);
                     }
 
                     if (downloaded) {
-                        TransferResult result = postProcessDownloadedFile(rawTmp, outTmp, outputFilePath, rawTempPath, outputTempPath, fileName, pathString(installPaths.livePath), installMode);
+                        if (Thread.currentThread().isInterrupted()) {
+                            return TransferResult.FAILED;
+                        }
+                        TransferResult result = postProcessDownloadedFile(rawTmp, outTmp, outputFilePath, rawTempPath,
+                                outputTempPath, fileName, pathString(installPaths.livePath), installMode,
+                                expected, entryOptions);
                         if (result != TransferResult.FAILED) {
                             return result;
                         }
                     }
                 } catch (IOException e) {
-                    logger.warning("Failed to download or extract plugin " + fileName + ": " + e.getMessage());
+                    if (!Thread.currentThread().isInterrupted()) {
+                        logger.warning("Failed to download or extract plugin " + fileName + ": " + e.getMessage());
+                    }
                 } finally {
                     cleanupQuietly(new File(rawTempPath));
                     cleanupQuietly(new File(outputTempPath));
@@ -235,29 +417,139 @@ public class PluginDownloader {
             }
             return TransferResult.FAILED;
         } finally {
-            if (hostSem != null) hostSem.release();
+            if (hostSem != null && hostPermitAcquired) hostSem.release();
         }
     }
 
+    /**
+     * Follows payload redirects explicitly so provider credentials are never
+     * replayed to a different origin (for example an object-storage CDN).
+     */
+    private boolean downloadWithScopedHeaders(String link, String githubToken, boolean requiresAuth,
+                                              File rawTmp, int attempt, String pluginName,
+                                              Map<String, String> requestHeaders) throws IOException {
+        final URI original;
+        try {
+            original = URI.create(link);
+        } catch (RuntimeException invalid) {
+            throw new IOException("Invalid download URL", invalid);
+        }
+        URI current = original;
+        for (int redirects = 0; redirects <= 5; redirects++) {
+            if (!httpUri(current)) return false;
+            if ("https".equalsIgnoreCase(original.getScheme())
+                    && "http".equalsIgnoreCase(current.getScheme())) {
+                logger.warning("Refusing insecure payload redirect for " + pluginName);
+                return false;
+            }
+            boolean sameOrigin = sameOrigin(original, current);
+            Map<String, String> scoped = sameOrigin
+                    ? requestHeaders : Collections.<String, String>emptyMap();
+            HttpURLConnection connection = openConnection(current.toASCIIString(), githubToken,
+                    requiresAuth && sameOrigin, scoped, false);
+            try {
+                int code = connection.getResponseCode();
+                if (code == HttpURLConnection.HTTP_MOVED_PERM
+                        || code == HttpURLConnection.HTTP_MOVED_TEMP
+                        || code == HttpURLConnection.HTTP_SEE_OTHER
+                        || code == 307 || code == 308) {
+                    String location = connection.getHeaderField("Location");
+                    if (location == null || redirects == 5) return false;
+                    try {
+                        current = current.resolve(location);
+                    } catch (RuntimeException invalid) {
+                        return false;
+                    }
+                    continue;
+                }
+                if (code == 403 || code == 429 || (code >= 500 && code < 600)) {
+                    backoffDelay(attempt, code, current.toASCIIString());
+                    return false;
+                }
+                if (code < 200 || code >= 300) return false;
+                if (!downloadWithVerification(rawTmp, connection)) return false;
+                return verifyChecksumIfProvided(rawTmp, connection);
+            } finally {
+                connection.disconnect();
+            }
+        }
+        return false;
+    }
+
+    private static boolean httpUri(URI uri) {
+        if (uri == null || uri.getHost() == null || uri.getUserInfo() != null) return false;
+        String scheme = uri.getScheme();
+        return "http".equalsIgnoreCase(scheme) || "https".equalsIgnoreCase(scheme);
+    }
+
+    private static boolean sameOrigin(URI left, URI right) {
+        if (left == null || right == null) return false;
+        return equalsIgnoreCase(left.getScheme(), right.getScheme())
+                && equalsIgnoreCase(left.getHost(), right.getHost())
+                && effectivePort(left) == effectivePort(right);
+    }
+
+    private static int effectivePort(URI uri) {
+        if (uri.getPort() >= 0) return uri.getPort();
+        return "https".equalsIgnoreCase(uri.getScheme()) ? 443 : 80;
+    }
+
+    private static boolean equalsIgnoreCase(String left, String right) {
+        return left == null ? right == null : right != null && left.equalsIgnoreCase(right);
+    }
+
     public boolean installLocalFile(Path source, String fileName, String customPath) throws IOException {
-        return processLocalFile(source, fileName, customPath, true) != TransferResult.FAILED;
+        return installLocalFileDetailed(source, fileName, customPath, true).handled();
     }
 
     public CheckResult checkLocalFile(Path source, String fileName, String customPath) throws IOException {
-        return mapCheckResult(processLocalFile(source, fileName, customPath, false));
+        TransferOutcome outcome = installLocalFileDetailed(source, fileName, customPath, false);
+        if (outcome.status == TransferOutcome.Status.AVAILABLE) return CheckResult.AVAILABLE;
+        if (outcome.status == TransferOutcome.Status.UNCHANGED) return CheckResult.UNCHANGED;
+        return CheckResult.FAILED;
+    }
+
+    public TransferOutcome installLocalFileDetailed(Path source, String fileName,
+                                                    String customPath, boolean installMode) throws IOException {
+        InstallPaths paths = resolveInstallPaths(fileName, customPath);
+        Path existing = paths.livePath != null && Files.isRegularFile(paths.livePath) ? paths.livePath : paths.targetPath;
+        JarMetadata before = readMetadata(existing);
+        transferCandidate.remove();
+        TransferResult result = processLocalFile(source, fileName, customPath, installMode);
+        TransferOutcome.Status status;
+        if (result == TransferResult.UNCHANGED) status = TransferOutcome.Status.UNCHANGED;
+        else if (result == TransferResult.APPLIED && installMode) status = TransferOutcome.Status.APPLIED;
+        else if (result == TransferResult.APPLIED) status = TransferOutcome.Status.AVAILABLE;
+        else status = TransferOutcome.Status.FAILED;
+        JarMetadata after = status == TransferOutcome.Status.APPLIED
+                ? readMetadata(paths.targetPath) : transferCandidate.get();
+        transferCandidate.remove();
+        String reason = status == TransferOutcome.Status.UNCHANGED ? "payload matches installed jar"
+                : status == TransferOutcome.Status.AVAILABLE ? "local payload differs from installed jar"
+                : status == TransferOutcome.Status.APPLIED ? "installed local file"
+                : "local file validation or install failed";
+        return new TransferOutcome(status, fileName, paths.targetPath, paths.livePath, before, after, reason);
     }
 
     private CheckResult mapCheckResult(TransferResult result) {
         if (result == TransferResult.APPLIED) {
             return CheckResult.AVAILABLE;
         }
-        if (result == TransferResult.UNCHANGED) {
+        if (result == TransferResult.UNCHANGED || result == TransferResult.BLOCKED) {
             return CheckResult.UNCHANGED;
         }
         return CheckResult.FAILED;
     }
 
     private TransferResult processLocalFile(Path source, String fileName, String customPath, boolean installMode) throws IOException {
+        return processLocalFile(source, fileName, customPath, installMode, null);
+    }
+
+    private TransferResult processLocalFile(Path source, String fileName, String customPath,
+                                            boolean installMode, EntryOptions entryOptions) throws IOException {
+        if (Thread.currentThread().isInterrupted()) {
+            return TransferResult.FAILED;
+        }
         if (source == null) {
             throw new IOException("Local file path is null");
         }
@@ -278,16 +570,21 @@ public class PluginDownloader {
 
         Files.copy(source, rawTmp.toPath(), StandardCopyOption.REPLACE_EXISTING);
         try {
-            return postProcessDownloadedFile(rawTmp, outTmp, outputFilePath, rawTempPath, outputTempPath, fileName, pathString(installPaths.livePath), installMode);
+            if (Thread.currentThread().isInterrupted()) {
+                return TransferResult.FAILED;
+            }
+            return postProcessDownloadedFile(rawTmp, outTmp, outputFilePath, rawTempPath, outputTempPath,
+                    fileName, pathString(installPaths.livePath), installMode, null, entryOptions);
         } finally {
             cleanupQuietly(new File(rawTempPath));
             cleanupQuietly(new File(outputTempPath));
         }
     }
 
-    private boolean downloadWithJava11(String link, String githubToken, boolean requiresAuth, File rawTmp, int attempt) throws IOException {
+    private boolean downloadWithJava11(String link, String githubToken, boolean requiresAuth, File rawTmp, int attempt,
+                                       Map<String, String> requestHeaders) throws IOException {
         try {
-            Java11Response r = executeJava11Get(link, githubToken, requiresAuth);
+            Java11Response r = executeJava11Get(link, githubToken, requiresAuth, requestHeaders);
             try {
                 int code = r.statusCode;
                 if (code == 403 || code == 429 || (code >= 500 && code < 600)) {
@@ -300,14 +597,16 @@ public class PluginDownloader {
                 closeQuietly(r.body);
             }
         } catch (Exception e) {
+            restoreInterruptFromCause(e);
             return false;
         }
     }
 
-    private boolean downloadWithApache(String link, String githubToken, boolean requiresAuth, File rawTmp, int attempt) throws IOException {
+    private boolean downloadWithApache(String link, String githubToken, boolean requiresAuth, File rawTmp, int attempt,
+                                       Map<String, String> requestHeaders) throws IOException {
         try {
             ensureClient();
-            CloseableHttpResponse resp = executeApacheGet(link, githubToken, requiresAuth);
+            CloseableHttpResponse resp = executeApacheGet(link, githubToken, requiresAuth, requestHeaders);
             try {
                 int code = resp.getStatusLine() != null ? resp.getStatusLine().getStatusCode() : 0;
                 if (code == 403 || code == 429 || (code >= 500 && code < 600)) {
@@ -323,12 +622,32 @@ public class PluginDownloader {
                 }
             }
         } catch (Exception e) {
+            restoreInterruptFromCause(e);
             return false;
         }
     }
 
-    private boolean downloadWithUrlConnection(String link, String githubToken, boolean requiresAuth, File rawTmp, int attempt, String pluginName) throws IOException {
-        HttpURLConnection connection = openConnection(link, githubToken, requiresAuth);
+    private static void restoreInterruptFromCause(Throwable error) {
+        Throwable current = error;
+        for (int depth = 0; current != null && depth < 12; depth++) {
+            if (current instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+            current = current.getCause();
+        }
+    }
+
+    private static void throwIfInterrupted() throws InterruptedIOException {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedIOException("operation interrupted");
+        }
+    }
+
+    private boolean downloadWithUrlConnection(String link, String githubToken, boolean requiresAuth, File rawTmp,
+                                              int attempt, String pluginName,
+                                              Map<String, String> requestHeaders) throws IOException {
+        HttpURLConnection connection = openConnection(link, githubToken, requiresAuth, requestHeaders);
         int code = 0;
         try {
             code = connection.getResponseCode();
@@ -341,7 +660,7 @@ public class PluginDownloader {
         if (!downloadWithVerification(rawTmp, connection)) {
             logger.warning("Download failed for " + pluginName + " (attempt " + attempt + ") - retrying lenient mode (old-plugin behavior)");
             try {
-                connection = openConnection(link, githubToken, requiresAuth);
+                connection = openConnection(link, githubToken, requiresAuth, requestHeaders);
                 return downloadLenient(rawTmp, connection);
             } catch (IOException ex) {
                 return false;
@@ -355,10 +674,34 @@ public class PluginDownloader {
     }
 
     private TransferResult postProcessDownloadedFile(File rawTmp, File outTmp, String outputFilePath, String rawTempPath, String outputTempPath, String pluginName, String livePathOverride, boolean installMode) throws IOException {
-        if (isZipFile(rawTempPath)) {
-            boolean extracted = extractFirstJarFromZip(rawTempPath, outputTempPath);
-            if (!extracted) {
-                moveReplace(rawTmp, outTmp);
+        return postProcessDownloadedFile(rawTmp, outTmp, outputFilePath, rawTempPath, outputTempPath,
+                pluginName, livePathOverride, installMode, null, null);
+    }
+
+    private TransferResult postProcessDownloadedFile(File rawTmp, File outTmp, String outputFilePath,
+                                                     String rawTempPath, String outputTempPath, String pluginName,
+                                                     String livePathOverride, boolean installMode,
+                                                     ResolvedUpdate expected) throws IOException {
+        return postProcessDownloadedFile(rawTmp, outTmp, outputFilePath, rawTempPath, outputTempPath,
+                pluginName, livePathOverride, installMode, expected, null);
+    }
+
+    private TransferResult postProcessDownloadedFile(File rawTmp, File outTmp, String outputFilePath,
+                                                     String rawTempPath, String outputTempPath, String pluginName,
+                                                     String livePathOverride, boolean installMode,
+                                                     ResolvedUpdate expected, EntryOptions entryOptions) throws IOException {
+        if (Thread.currentThread().isInterrupted()) {
+            return TransferResult.FAILED;
+        }
+        if (looksLikePluginJar(rawTmp)) {
+            // Plugin jars are ZIP containers too. Keep a valid outer plugin intact even when
+            // it embeds dependency jars (for example under META-INF/jars).
+            moveReplace(rawTmp, outTmp);
+        } else if (isZipFile(rawTempPath)) {
+            if (!extractFirstPluginJarFromZip(rawTempPath, outputTempPath)) {
+                logger.warning("Downloaded archive for " + pluginName
+                        + " did not contain a supported plugin JAR");
+                return TransferResult.FAILED;
             }
         } else {
             moveReplace(rawTmp, outTmp);
@@ -369,7 +712,36 @@ public class PluginDownloader {
             return TransferResult.FAILED;
         }
 
+        if (!matchesExpectedMetadata(outTmp, expected)) {
+            logger.warning("Downloaded file for " + pluginName + " did not match provider metadata");
+            return TransferResult.FAILED;
+        }
+        JarMetadata candidate = readMetadata(outTmp.toPath());
+        transferCandidate.set(candidate);
+
         File target = new File(outputFilePath);
+        if (entryOptions != null && !entryOptions.bool("force", false)) {
+            Path live = null;
+            try {
+                if (livePathOverride != null) live = Paths.get(livePathOverride);
+            } catch (InvalidPathException ignored) {
+            }
+            Path existing = live != null && Files.isRegularFile(live) ? live : target.toPath();
+            JarMetadata local = readMetadata(existing);
+            if (local != null && candidate != null) {
+                boolean metadataChanged = local.sha1 == null || candidate.sha1 == null
+                        || !local.sha1.equalsIgnoreCase(candidate.sha1);
+                VersionPolicy policy = VersionPolicy.from(entryOptions);
+                VersionDecision decision = policy.evaluate(local.version, candidate.version, metadataChanged);
+                if (!decision.allowed) {
+                    transferBlockReason.set("versionPolicy " + policy.name().toLowerCase(Locale.ROOT)
+                            + ": " + decision.reason);
+                    cleanupQuietly(outTmp);
+                    cleanupQuietly(rawTmp);
+                    return TransferResult.BLOCKED;
+                }
+            }
+        }
         if (UpdateOptions.debug)
             logger.info("[DEBUG] " + (installMode ? "Ready to install" : "Ready to compare (check mode)") + ": temp=" + outTmp.getAbsolutePath() + " -> target=" + target.getAbsolutePath());
         if (shouldSkipDuplicateInstall(outTmp, target, pluginName, livePathOverride)) {
@@ -385,14 +757,38 @@ public class PluginDownloader {
             cleanupQuietly(rawTmp);
             return TransferResult.APPLIED;
         }
+        if (Thread.currentThread().isInterrupted()) {
+            cleanupQuietly(outTmp);
+            cleanupQuietly(rawTmp);
+            return TransferResult.FAILED;
+        }
         if (UpdateOptions.rollbackEnabled) {
             try {
-                RollbackManager.prepareBackup(logger, pluginName, target.toPath());
+                Path livePath = null;
+                if (livePathOverride != null && !livePathOverride.trim().isEmpty()) {
+                    try {
+                        livePath = Paths.get(livePathOverride);
+                    } catch (InvalidPathException ignored) {
+                    }
+                }
+                RollbackManager.prepareBackup(logger, pluginName, target.toPath(), livePath);
             } catch (Exception ex) {
                 if (UpdateOptions.debug) {
                     logger.log(java.util.logging.Level.FINE, "[DEBUG] Unable to snapshot rollback for " + pluginName, ex);
                 }
             }
+        }
+        if (Thread.currentThread().isInterrupted()) {
+            cleanupQuietly(outTmp);
+            cleanupQuietly(rawTmp);
+            return TransferResult.FAILED;
+        }
+        // Claim the destructive handoff atomically against the timeout task. If the
+        // deadline won first, a fully downloaded payload must not cross the install boundary.
+        if (!claimInstallCommit()) {
+            cleanupQuietly(outTmp);
+            cleanupQuietly(rawTmp);
+            return TransferResult.FAILED;
         }
         moveReplace(outTmp, target);
         if (UpdateOptions.rollbackEnabled) {
@@ -404,6 +800,23 @@ public class PluginDownloader {
         notifyInstalled(pluginName, target.toPath());
         cleanupQuietly(rawTmp);
         return TransferResult.APPLIED;
+    }
+
+    private boolean matchesExpectedMetadata(File file, ResolvedUpdate expected) {
+        if (expected == null || file == null || !file.isFile()) return true;
+        try {
+            if (expected.size >= 0 && file.length() != expected.size) {
+                logger.warning("Size mismatch for " + file.getName() + ": expected=" + expected.size + ", actual=" + file.length());
+                return false;
+            }
+            if (notBlank(expected.sha512) && !digestMatches(file, "SHA-512", expected.sha512)) return false;
+            if (notBlank(expected.sha256) && !digestMatches(file, "SHA-256", expected.sha256)) return false;
+            if (notBlank(expected.sha1) && !digestMatches(file, "SHA-1", expected.sha1)) return false;
+            return !notBlank(expected.md5) || digestMatches(file, "MD5", expected.md5);
+        } catch (Exception ex) {
+            logger.warning("Unable to verify provider checksum for " + file.getName() + ": " + ex.getMessage());
+            return false;
+        }
     }
 
 
@@ -647,31 +1060,47 @@ public class PluginDownloader {
     }
 
 
-    private boolean extractFirstJarFromZip(String zipFilePath, String outputFilePath) throws IOException {
+    private boolean extractFirstPluginJarFromZip(String zipFilePath, String outputFilePath) throws IOException {
         try (ZipFile zipFile = new ZipFile(zipFilePath)) {
-            List<? extends ZipEntry> entries = Collections.list(zipFile.entries());
-            Optional<? extends ZipEntry> zipEntry = entries.stream()
-                    .filter(entry -> !entry.isDirectory() &&
-                            !entry.getName().toLowerCase().contains("javadoc") &&
-                            !entry.getName().toLowerCase().contains("sources") &&
-                            !entry.getName().toLowerCase().contains("api/") &&
-                            entry.getName().endsWith(".jar"))
-                    .findFirst();
-
-            if (!zipEntry.isPresent()) {
-                return false;
-            }
-
-            try (InputStream in = new BufferedInputStream(zipFile.getInputStream(zipEntry.get()), 65536);
-                 OutputStream out = new BufferedOutputStream(new FileOutputStream(outputFilePath), 65536)) {
-                byte[] buffer = new byte[65536];
-                int bytesRead;
-                while ((bytesRead = in.read(buffer)) != -1) {
-                    out.write(buffer, 0, bytesRead);
+            List<ZipEntry> candidates = new ArrayList<ZipEntry>();
+            for (ZipEntry entry : Collections.list(zipFile.entries())) {
+                String name = entry.getName().toLowerCase(Locale.ROOT);
+                if (!entry.isDirectory()
+                        && !name.contains("javadoc")
+                        && !name.contains("sources")
+                        && !name.contains("api/")
+                        && name.endsWith(".jar")) {
+                    candidates.add(entry);
                 }
-                out.flush();
             }
-            return true;
+            Collections.sort(candidates, new Comparator<ZipEntry>() {
+                @Override
+                public int compare(ZipEntry left, ZipEntry right) {
+                    int insensitive = left.getName().compareToIgnoreCase(right.getName());
+                    return insensitive != 0 ? insensitive : left.getName().compareTo(right.getName());
+                }
+            });
+
+            File output = new File(outputFilePath);
+            cleanupQuietly(output);
+            for (ZipEntry candidate : candidates) {
+                throwIfInterrupted();
+                try (InputStream in = new BufferedInputStream(zipFile.getInputStream(candidate), 65536);
+                     OutputStream out = new BufferedOutputStream(new FileOutputStream(output), 65536)) {
+                    byte[] buffer = new byte[65536];
+                    int bytesRead;
+                    while ((bytesRead = in.read(buffer)) != -1) {
+                        throwIfInterrupted();
+                        out.write(buffer, 0, bytesRead);
+                    }
+                    out.flush();
+                }
+                if (looksLikePluginJar(output)) {
+                    return true;
+                }
+                cleanupQuietly(output);
+            }
+            return false;
         }
     }
 
@@ -680,14 +1109,52 @@ public class PluginDownloader {
     }
 
     public boolean downloadJenkinsPlugin(String link, String fileName, String customPath) {
-        return transferJenkinsPlugin(link, fileName, customPath, true) != TransferResult.FAILED;
+        return transferJenkinsPluginDetailed(link, fileName, customPath, true).handled();
     }
 
     public CheckResult checkJenkinsPlugin(String link, String fileName, String customPath) {
-        return mapCheckResult(transferJenkinsPlugin(link, fileName, customPath, false));
+        TransferOutcome outcome = transferJenkinsPluginDetailed(link, fileName, customPath, false);
+        if (outcome.status == TransferOutcome.Status.AVAILABLE) return CheckResult.AVAILABLE;
+        if (outcome.status == TransferOutcome.Status.UNCHANGED
+                || outcome.status == TransferOutcome.Status.BLOCKED) return CheckResult.UNCHANGED;
+        return CheckResult.FAILED;
     }
 
-    private TransferResult transferJenkinsPlugin(String link, String fileName, String customPath, boolean installMode) {
+    public TransferOutcome transferJenkinsPluginDetailed(String link, String fileName,
+                                                          String customPath, boolean installMode) {
+        return transferJenkinsPluginDetailed(link, fileName, customPath, installMode, null);
+    }
+
+    TransferOutcome transferJenkinsPluginDetailed(String link, String fileName,
+                                                   String customPath, boolean installMode,
+                                                   EntryOptions entryOptions) {
+        InstallPaths paths = resolveInstallPaths(fileName, customPath);
+        Path existing = paths.livePath != null && Files.isRegularFile(paths.livePath) ? paths.livePath : paths.targetPath;
+        JarMetadata before = readMetadata(existing);
+        transferCandidate.remove();
+        transferBlockReason.remove();
+        TransferResult result = transferJenkinsPlugin(link, fileName, customPath, installMode, entryOptions);
+        TransferOutcome.Status status;
+        if (result == TransferResult.UNCHANGED) status = TransferOutcome.Status.UNCHANGED;
+        else if (result == TransferResult.BLOCKED) status = TransferOutcome.Status.BLOCKED;
+        else if (result == TransferResult.APPLIED && installMode) status = TransferOutcome.Status.APPLIED;
+        else if (result == TransferResult.APPLIED) status = TransferOutcome.Status.AVAILABLE;
+        else status = TransferOutcome.Status.FAILED;
+        JarMetadata after = status == TransferOutcome.Status.APPLIED
+                ? readMetadata(paths.targetPath) : transferCandidate.get();
+        transferCandidate.remove();
+        String reason = status == TransferOutcome.Status.UNCHANGED ? "payload matches installed jar"
+                : status == TransferOutcome.Status.BLOCKED
+                ? (transferBlockReason.get() == null ? "blocked by version policy" : transferBlockReason.get())
+                : status == TransferOutcome.Status.AVAILABLE ? "payload differs from installed jar"
+                : status == TransferOutcome.Status.APPLIED ? "installed"
+                : "Jenkins download, validation, or install failed";
+        transferBlockReason.remove();
+        return new TransferOutcome(status, fileName, paths.targetPath, paths.livePath, before, after, reason);
+    }
+
+    private TransferResult transferJenkinsPlugin(String link, String fileName, String customPath,
+                                                 boolean installMode, EntryOptions entryOptions) {
         String tempBase = UpdateOptions.tempPath != null && !UpdateOptions.tempPath.isEmpty() ? ensureDir(UpdateOptions.tempPath) : "plugins/";
         String rawTempPath = tempBase + fileName + ".download.tmp";
         InstallPaths installPaths = resolveInstallPaths(fileName, customPath);
@@ -695,6 +1162,9 @@ public class PluginDownloader {
         String outputTempPath = outputFilePath + ".temp";
 
         for (int attempt = 1; attempt <= Math.max(2, UpdateOptions.maxRetries); attempt++) {
+            if (Thread.currentThread().isInterrupted()) {
+                return TransferResult.FAILED;
+            }
             File rawTmp = new File(rawTempPath);
             File outTmp = new File(outputTempPath);
             cleanupQuietly(rawTmp);
@@ -716,6 +1186,7 @@ public class PluginDownloader {
                         Thread.sleep(delay);
                     } catch (InterruptedException ignored2) {
                         Thread.currentThread().interrupt();
+                        return TransferResult.FAILED;
                     }
                     continue;
                 }
@@ -723,28 +1194,20 @@ public class PluginDownloader {
                     logger.info("Download failed (attempt " + attempt + ")");
                     continue;
                 }
-                if (isZipFile(rawTempPath)) {
-                    boolean extracted = extractFirstJarFromZip(rawTempPath, outputTempPath);
-                    if (!extracted) {
-                        moveReplace(rawTmp, outTmp);
-                    }
-                } else {
-                    moveReplace(rawTmp, outTmp);
-                }
-                if (!validateJar(outTmp)) {
-                    logger.info("Downloaded file is not a valid JAR (attempt " + attempt + ")");
-                    continue;
-                }
-                if (!verifyChecksumIfProvided(outTmp, connection)) {
+                if (!verifyChecksumIfProvided(rawTmp, connection)) {
                     logger.info("Checksum mismatch from server (attempt " + attempt + ")");
                     continue;
                 }
-                TransferResult result = postProcessDownloadedFile(rawTmp, outTmp, outputFilePath, rawTempPath, outputTempPath, fileName, pathString(installPaths.livePath), installMode);
+                TransferResult result = postProcessDownloadedFile(rawTmp, outTmp, outputFilePath,
+                        rawTempPath, outputTempPath, fileName, pathString(installPaths.livePath),
+                        installMode, null, entryOptions);
                 if (result != TransferResult.FAILED) {
                     return result;
                 }
             } catch (IOException e) {
-                logger.info("Failed to download or extract plugin: " + e.getMessage());
+                if (!Thread.currentThread().isInterrupted()) {
+                    logger.info("Failed to download or extract plugin: " + e.getMessage());
+                }
             } finally {
                 cleanupQuietly(new File(rawTempPath));
                 cleanupQuietly(new File(outputTempPath));
@@ -780,8 +1243,19 @@ public class PluginDownloader {
     }
 
     private HttpURLConnection openConnection(String link, String githubToken, boolean requiresAuth) throws IOException {
+        return openConnection(link, githubToken, requiresAuth, Collections.<String, String>emptyMap());
+    }
+
+    private HttpURLConnection openConnection(String link, String githubToken, boolean requiresAuth,
+                                             Map<String, String> requestHeaders) throws IOException {
+        return openConnection(link, githubToken, requiresAuth, requestHeaders, true);
+    }
+
+    private HttpURLConnection openConnection(String link, String githubToken, boolean requiresAuth,
+                                             Map<String, String> requestHeaders,
+                                             boolean followRedirects) throws IOException {
         HttpURLConnection connection = (HttpURLConnection) new URL(link).openConnection();
-        connection.setInstanceFollowRedirects(true);
+        connection.setInstanceFollowRedirects(followRedirects);
 
         String ua = (overrideUserAgent != null && !overrideUserAgent.trim().isEmpty()
                 && !"AutoUpdatePlugins".equalsIgnoreCase(overrideUserAgent))
@@ -811,6 +1285,13 @@ public class PluginDownloader {
 
         if (extraHeaders != null) {
             for (Map.Entry<String, String> e : extraHeaders.entrySet()) {
+                if (e.getKey() != null && e.getValue() != null) {
+                    connection.setRequestProperty(e.getKey(), e.getValue());
+                }
+            }
+        }
+        if (requestHeaders != null) {
+            for (Map.Entry<String, String> e : requestHeaders.entrySet()) {
                 if (e.getKey() != null && e.getValue() != null) {
                     connection.setRequestProperty(e.getKey(), e.getValue());
                 }
@@ -855,6 +1336,11 @@ public class PluginDownloader {
     }
 
     private Java11Response executeJava11Get(String link, String githubToken, boolean requiresAuth) throws Exception {
+        return executeJava11Get(link, githubToken, requiresAuth, Collections.<String, String>emptyMap());
+    }
+
+    private Java11Response executeJava11Get(String link, String githubToken, boolean requiresAuth,
+                                            Map<String, String> requestHeaders) throws Exception {
         Class<?> httpClientCls = Class.forName("java.net.http.HttpClient");
         Class<?> httpRequestCls = Class.forName("java.net.http.HttpRequest");
         Class<?> httpResponseCls = Class.forName("java.net.http.HttpResponse");
@@ -899,6 +1385,14 @@ public class PluginDownloader {
                 }
             }
         }
+        if (requestHeaders != null) {
+            for (Map.Entry<String, String> e : requestHeaders.entrySet()) {
+                if (e.getKey() != null && e.getValue() != null) {
+                    reqBuilder.getClass().getMethod("header", String.class, String.class)
+                            .invoke(reqBuilder, e.getKey(), e.getValue());
+                }
+            }
+        }
 
         Object readTimeout = durationCls.getMethod("ofMillis", long.class).invoke(null, (long) UpdateOptions.readTimeoutMs);
         reqBuilder.getClass().getMethod("timeout", durationCls).invoke(reqBuilder, readTimeout);
@@ -937,6 +1431,7 @@ public class PluginDownloader {
             byte[] buffer = new byte[65536];
             int n;
             while ((n = in0.read(buffer)) != -1) {
+                throwIfInterrupted();
                 out.write(buffer, 0, n);
                 written += n;
             }
@@ -1001,6 +1496,11 @@ public class PluginDownloader {
     }
 
     private CloseableHttpResponse executeApacheGet(String link, String githubToken, boolean requiresAuth) throws IOException {
+        return executeApacheGet(link, githubToken, requiresAuth, Collections.<String, String>emptyMap());
+    }
+
+    private CloseableHttpResponse executeApacheGet(String link, String githubToken, boolean requiresAuth,
+                                                    Map<String, String> requestHeaders) throws IOException {
         ensureClient();
         HttpGet get = new HttpGet(link);
         String ua = (overrideUserAgent != null && !overrideUserAgent.trim().isEmpty()
@@ -1022,6 +1522,13 @@ public class PluginDownloader {
         }
         if (extraHeaders != null) {
             for (Map.Entry<String, String> e : extraHeaders.entrySet()) {
+                if (e.getKey() != null && e.getValue() != null) {
+                    get.setHeader(e.getKey(), e.getValue());
+                }
+            }
+        }
+        if (requestHeaders != null) {
+            for (Map.Entry<String, String> e : requestHeaders.entrySet()) {
                 if (e.getKey() != null && e.getValue() != null) {
                     get.setHeader(e.getKey(), e.getValue());
                 }
@@ -1069,6 +1576,7 @@ public class PluginDownloader {
             byte[] buffer = new byte[65536];
             int n;
             while ((n = in.read(buffer)) != -1) {
+                throwIfInterrupted();
                 out.write(buffer, 0, n);
                 written += n;
             }
@@ -1107,6 +1615,7 @@ public class PluginDownloader {
             byte[] buffer = new byte[65536];
             int n;
             while ((n = in.read(buffer)) != -1) {
+                throwIfInterrupted();
                 out.write(buffer, 0, n);
                 written += n;
             }
@@ -1168,7 +1677,10 @@ public class PluginDownloader {
             out = new BufferedOutputStream(new FileOutputStream(outFile), 65536);
             byte[] buffer = new byte[65536];
             int r;
-            while ((r = in.read(buffer)) != -1) out.write(buffer, 0, r);
+            while ((r = in.read(buffer)) != -1) {
+                throwIfInterrupted();
+                out.write(buffer, 0, r);
+            }
             out.flush();
             return true;
         } catch (IOException e) {
@@ -1195,14 +1707,61 @@ public class PluginDownloader {
     }
 
     public boolean buildFromGitHubRepo(String repoPath, String fileName, String key, String customPath, String branchOverride) throws IOException {
-        return transferBuiltGitHubRepo(repoPath, fileName, key, customPath, branchOverride, true) != TransferResult.FAILED;
+        return buildFromGitHubRepo(repoPath, fileName, key, customPath, branchOverride, null);
+    }
+
+    boolean buildFromGitHubRepo(String repoPath, String fileName, String key, String customPath,
+                                String branchOverride, EntryOptions entryOptions) throws IOException {
+        return transferBuiltGitHubRepo(repoPath, fileName, key, customPath,
+                branchOverride, true, entryOptions) != TransferResult.FAILED;
     }
 
     public CheckResult checkBuildFromGitHubRepo(String repoPath, String fileName, String key, String customPath, String branchOverride) throws IOException {
-        return mapCheckResult(transferBuiltGitHubRepo(repoPath, fileName, key, customPath, branchOverride, false));
+        return checkBuildFromGitHubRepo(repoPath, fileName, key, customPath, branchOverride, null);
     }
 
-    private TransferResult transferBuiltGitHubRepo(String repoPath, String fileName, String key, String customPath, String branchOverride, boolean installMode) throws IOException {
+    CheckResult checkBuildFromGitHubRepo(String repoPath, String fileName, String key, String customPath,
+                                         String branchOverride, EntryOptions entryOptions) throws IOException {
+        return mapCheckResult(transferBuiltGitHubRepo(repoPath, fileName, key, customPath,
+                branchOverride, false, entryOptions));
+    }
+
+    TransferOutcome buildFromGitHubRepoDetailed(String repoPath, String fileName, String key,
+                                                String customPath, String branchOverride,
+                                                boolean installMode, EntryOptions entryOptions) throws IOException {
+        InstallPaths paths = resolveInstallPaths(fileName, customPath);
+        Path existing = paths.livePath != null && Files.isRegularFile(paths.livePath)
+                ? paths.livePath : paths.targetPath;
+        JarMetadata before = readMetadata(existing);
+        transferCandidate.remove();
+        transferBlockReason.remove();
+        TransferResult result = transferBuiltGitHubRepo(repoPath, fileName, key, customPath,
+                branchOverride, installMode, entryOptions);
+        TransferOutcome.Status status;
+        if (result == TransferResult.BLOCKED) status = TransferOutcome.Status.BLOCKED;
+        else if (result == TransferResult.UNCHANGED) status = TransferOutcome.Status.UNCHANGED;
+        else if (result == TransferResult.APPLIED && installMode) status = TransferOutcome.Status.APPLIED;
+        else if (result == TransferResult.APPLIED) status = TransferOutcome.Status.AVAILABLE;
+        else status = TransferOutcome.Status.FAILED;
+        JarMetadata after = status == TransferOutcome.Status.APPLIED
+                ? readMetadata(paths.targetPath) : transferCandidate.get();
+        String blockReason = transferBlockReason.get();
+        transferCandidate.remove();
+        transferBlockReason.remove();
+        String reason = status == TransferOutcome.Status.BLOCKED
+                ? (blockReason == null ? "version policy blocked source build" : blockReason)
+                : status == TransferOutcome.Status.UNCHANGED ? "built payload matches installed jar"
+                : status == TransferOutcome.Status.AVAILABLE ? "built payload differs from installed jar"
+                : status == TransferOutcome.Status.APPLIED ? "installed source build"
+                : "source build, validation, or install failed";
+        return new TransferOutcome(status, fileName, paths.targetPath, paths.livePath,
+                before, after, reason);
+    }
+
+    private TransferResult transferBuiltGitHubRepo(String repoPath, String fileName, String key,
+                                                   String customPath, String branchOverride,
+                                                   boolean installMode, EntryOptions entryOptions) throws IOException {
+        throwIfInterrupted();
         if (repoPath == null || repoPath.isEmpty()) throw new IOException("Invalid repo path");
         if (UpdateOptions.debug) logger.info("[DEBUG] Starting GitHub build for " + repoPath);
 
@@ -1216,7 +1775,10 @@ public class PluginDownloader {
                 int r;
                 InputStream in = info.getInputStream();
                 try {
-                    while ((r = in.read(buf)) != -1) baos.write(buf, 0, r);
+                    while ((r = in.read(buf)) != -1) {
+                        throwIfInterrupted();
+                        baos.write(buf, 0, r);
+                    }
                 } finally {
                     try {
                         in.close();
@@ -1237,8 +1799,10 @@ public class PluginDownloader {
                 }
             }
         } catch (Throwable ignored) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new InterruptedIOException("source metadata request interrupted");
+            }
         }
-
         if (defaultBranch == null || defaultBranch.trim().isEmpty()) defaultBranch = "main";
 
         LinkedHashSet<String> branchCandidates = new LinkedHashSet<>();
@@ -1257,6 +1821,7 @@ public class PluginDownloader {
         File zipFile = new File(workDir, "repo.zip");
         boolean gotZip = false;
         for (String br : branches) {
+            throwIfInterrupted();
             String zipUrl = "https://codeload.github.com" + repoPath + "/zip/refs/heads/" + br;
             try {
                 HttpURLConnection c = openConnection(zipUrl, key, true);
@@ -1267,6 +1832,9 @@ public class PluginDownloader {
                     break;
                 }
             } catch (Throwable ignored) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedIOException("source archive request interrupted");
+                }
             }
         }
         if (!gotZip) {
@@ -1296,23 +1864,32 @@ public class PluginDownloader {
         }
 
         int exit;
-        if (isMaven) {
-            File mvnw = findFile(buildRoot, "mvnw", "mvnw.cmd", "mvnw.bat");
-            if (mvnw != null) setExecutable(mvnw);
-            String cmd = (mvnw != null) ? mvnw.getAbsolutePath() : "mvn";
-            exit = run(buildRoot, cmd, "-q", "-U", "-DskipTests", "package");
-        } else {
-            File grw = findFile(buildRoot, "gradlew", "gradlew.bat");
-            if (grw != null) setExecutable(grw);
-            String cmd = (grw != null) ? grw.getAbsolutePath() : "gradle";
+        BuildLibrarySupport.Provisioned libraries = BuildLibrarySupport.prepare(
+                entryOptions, workDir.toPath().resolve("build-libraries"));
+        try {
+            if (isMaven) {
+                File mvnw = findFile(buildRoot, "mvnw", "mvnw.cmd", "mvnw.bat");
+                if (mvnw != null) setExecutable(mvnw);
+                String cmd = (mvnw != null) ? mvnw.getAbsolutePath() : "mvn";
+                exit = run(buildRoot, cmd, libraries.mavenArguments(
+                        Arrays.asList("-q", "-U", "-DskipTests", "package")));
+            } else {
+                File grw = findFile(buildRoot, "gradlew", "gradlew.bat");
+                if (grw != null) setExecutable(grw);
+                String cmd = (grw != null) ? grw.getAbsolutePath() : "gradle";
 
-            boolean hasShadow = fileContains(new File(buildRoot, "build.gradle"))
-                    || fileContains(new File(buildRoot, "build.gradle.kts"));
-            String task = hasShadow ? "shadowJar" : "build";
-            exit = run(buildRoot, cmd, "--no-daemon", "-x", "test", task);
-            if (exit != 0 && hasShadow) {
-                exit = run(buildRoot, cmd, "--no-daemon", "-x", "test", "build");
+                boolean hasShadow = fileContains(new File(buildRoot, "build.gradle"))
+                        || fileContains(new File(buildRoot, "build.gradle.kts"));
+                String task = hasShadow ? "shadowJar" : "build";
+                exit = run(buildRoot, cmd, libraries.gradleArguments(
+                        Arrays.asList("--no-daemon", "-x", "test", task)));
+                if (exit != 0 && hasShadow) {
+                    exit = run(buildRoot, cmd, libraries.gradleArguments(
+                            Arrays.asList("--no-daemon", "-x", "test", "build")));
+                }
             }
+        } finally {
+            libraries.close();
         }
         if (exit != 0) {
             logger.warning("Build failed for " + fileName + " (" + repoPath + ") with exit code " + exit);
@@ -1327,19 +1904,9 @@ public class PluginDownloader {
         }
 
 
-        InstallPaths installPaths = resolveInstallPaths(fileName, customPath);
-        String outputFilePath = installPaths.targetPath.toString();
-        File out = new File(outputFilePath);
         if (UpdateOptions.debug) logger.info("[DEBUG] Built jar selected: " + jar.getAbsolutePath());
-        if (shouldSkipDuplicateInstall(jar, out, fileName, pathString(installPaths.livePath))) {
-            return TransferResult.UNCHANGED;
-        }
-        if (!installMode) {
-            return TransferResult.APPLIED;
-        }
-        copyFile(jar, out);
-        notifyInstalled(fileName, out.toPath());
-        return TransferResult.APPLIED;
+        throwIfInterrupted();
+        return processLocalFile(jar.toPath(), fileName, customPath, installMode, entryOptions);
         } finally {
             cleanupTreeQuietly(workDir.toPath());
         }
@@ -1410,25 +1977,65 @@ public class PluginDownloader {
         return code == 0;
     }
 
-    private Path selectBuiltPluginJar(Path root) throws IOException {
+    Path selectBuiltPluginJar(Path root) throws IOException {
+        if (root == null || !Files.isDirectory(root)) return null;
+        final Path normalizedRoot = root.toAbsolutePath().normalize();
         List<Path> jars;
-        try (Stream<Path> s = Files.walk(root)) {
-            jars = s.filter(p -> p.toString().endsWith(".jar"))
-                    .filter(p -> !p.getFileName().toString().toLowerCase(Locale.ROOT).contains("sources"))
-                    .filter(p -> !p.getFileName().toString().toLowerCase(Locale.ROOT).contains("javadoc"))
+        try (Stream<Path> stream = Files.walk(normalizedRoot)) {
+            jars = stream
+                    .filter(Files::isRegularFile)
+                    .filter(this::isBuildOutputJar)
+                    .filter(path -> !isAuxiliaryJar(path.getFileName().toString()))
+                    .filter(path -> looksLikePluginJar(path.toFile()))
                     .collect(Collectors.toCollection(ArrayList::new));
         }
-        if (jars.isEmpty()) return null;
+        Collections.sort(jars, new Comparator<Path>() {
+            @Override
+            public int compare(Path left, Path right) {
+                int scoreOrder = Integer.compare(
+                        scoreJar(right.getFileName().toString().toLowerCase(Locale.ROOT)),
+                        scoreJar(left.getFileName().toString().toLowerCase(Locale.ROOT)));
+                if (scoreOrder != 0) return scoreOrder;
+                String leftPath = normalizedRoot.relativize(left.toAbsolutePath().normalize()).toString();
+                String rightPath = normalizedRoot.relativize(right.toAbsolutePath().normalize()).toString();
+                int insensitive = leftPath.compareToIgnoreCase(rightPath);
+                return insensitive != 0 ? insensitive : leftPath.compareTo(rightPath);
+            }
+        });
+        return jars.isEmpty() ? null : jars.get(0);
+    }
 
-        for (Path p : jars) {
-            if (looksLikePluginJar(p.toFile())) return p;
+    private boolean isBuildOutputJar(Path path) {
+        if (path == null || path.getFileName() == null
+                || !path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar")) {
+            return false;
         }
-        return jars.stream().max(Comparator.comparingLong(p -> p.toFile().length())).orElse(null);
+        Path parent = path.getParent();
+        if (parent == null || parent.getFileName() == null) return false;
+        String parentName = parent.getFileName().toString();
+        if ("target".equalsIgnoreCase(parentName)) return true;
+        Path grandparent = parent.getParent();
+        return "libs".equalsIgnoreCase(parentName)
+                && grandparent != null
+                && grandparent.getFileName() != null
+                && "build".equalsIgnoreCase(grandparent.getFileName().toString());
+    }
+
+    private boolean isAuxiliaryJar(String fileName) {
+        String name = fileName == null ? "" : fileName.toLowerCase(Locale.ROOT);
+        return name.contains("-sources")
+                || name.contains("-javadoc")
+                || name.startsWith("original-")
+                || name.contains("tests")
+                || name.contains("test-fixtures");
     }
 
     private boolean looksLikePluginJar(File jar) {
         try (JarFile jf = new JarFile(jar)) {
-            return jf.getEntry("plugin.yml") != null || jf.getEntry("bungee.yml") != null || jf.getEntry("velocity-plugin.json") != null;
+            return jf.getEntry("plugin.yml") != null
+                    || jf.getEntry("paper-plugin.yml") != null
+                    || jf.getEntry("bungee.yml") != null
+                    || jf.getEntry("velocity-plugin.json") != null;
         } catch (IOException ignored) {
             return false;
         }
@@ -1672,6 +2279,7 @@ public class PluginDownloader {
         try (InputStream in = new BufferedInputStream(new FileInputStream(file), 65536); DigestInputStream dis = new DigestInputStream(in, md)) {
             byte[] buf = new byte[65536];
             while (dis.read(buf) != -1) {
+                throwIfInterrupted();
             }
         }
         byte[] digest = md.digest();
@@ -1711,6 +2319,7 @@ public class PluginDownloader {
             ZipEntry entry;
             byte[] buffer = new byte[65536];
             while ((entry = zis.getNextEntry()) != null) {
+                throwIfInterrupted();
                 Path outPath = destDir.toPath().resolve(entry.getName()).normalize();
                 if (!outPath.startsWith(destDir.toPath())) {
                     throw new IOException("Zip slip detected: " + entry.getName());
@@ -1722,6 +2331,7 @@ public class PluginDownloader {
                     try (OutputStream os = new BufferedOutputStream(new FileOutputStream(outPath.toFile()))) {
                         int len;
                         while ((len = zis.read(buffer)) != -1) {
+                            throwIfInterrupted();
                             os.write(buffer, 0, len);
                         }
                     }
@@ -1782,115 +2392,77 @@ public class PluginDownloader {
     }
 
     private int run(File cwd, String... cmd) {
+        Process process = null;
         try {
             ProcessBuilder pb = new ProcessBuilder(cmd);
             pb.directory(cwd);
             pb.redirectErrorStream(true);
-            Process p = pb.start();
-            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
-            try {
-                String line;
-                while ((line = r.readLine()) != null) {
-                    if (UpdateOptions.debug) logger.info("[DEBUG] " + line);
+            process = pb.start();
+            final Process running = process;
+            Thread outputReader = new Thread(() -> {
+                try (BufferedReader reader = new BufferedReader(new InputStreamReader(running.getInputStream()))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) {
+                        if (UpdateOptions.debug) logger.info("[DEBUG] " + line);
+                    }
+                } catch (IOException ignored) {
                 }
-            } finally {
+            }, "aup-build-output");
+            outputReader.setDaemon(true);
+            outputReader.start();
+            while (process.isAlive()) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new InterruptedException("build interrupted");
+                }
+                process.waitFor(250, java.util.concurrent.TimeUnit.MILLISECONDS);
+            }
+            try {
+                outputReader.join(1000L);
+            } catch (InterruptedException interrupted) {
+                throw interrupted;
+            }
+            return process.exitValue();
+        } catch (InterruptedException interrupted) {
+            if (process != null && process.isAlive()) {
+                process.destroy();
                 try {
-                    r.close();
-                } catch (Exception ignored) {
+                    if (!process.waitFor(1, java.util.concurrent.TimeUnit.SECONDS)) {
+                        process.destroyForcibly();
+                    }
+                } catch (InterruptedException ignored) {
+                    process.destroyForcibly();
                 }
             }
-            return p.waitFor();
+            Thread.currentThread().interrupt();
+            return -1;
         } catch (Exception e) {
             if (UpdateOptions.debug) logger.info("[DEBUG] Build failed to start: " + e.getMessage());
             return -1;
         }
     }
 
-    private File pickBuiltJar(File buildRoot) {
-
-        List<File> candidates = new ArrayList<File>();
-        File libs = new File(buildRoot, "build/libs");
-        if (libs.isDirectory()) {
-            File[] arr = libs.listFiles(new FilenameFilter() {
-                public boolean accept(File d, String n) {
-                    return n.endsWith(".jar");
-                }
-            });
-            if (arr != null) Collections.addAll(candidates, arr);
+    private int run(File cwd, String executable, List<String> arguments) {
+        List<String> command = new ArrayList<String>();
+        if (System.getProperty("os.name", "").toLowerCase(Locale.ROOT).contains("win")) {
+            command.add("cmd");
+            command.add("/c");
         }
-        File target = new File(buildRoot, "target");
-        if (target.isDirectory()) {
-            File[] arr = target.listFiles(new FilenameFilter() {
-                public boolean accept(File d, String n) {
-                    return n.endsWith(".jar");
-                }
-            });
-            if (arr != null) Collections.addAll(candidates, arr);
-        }
+        command.add(executable);
+        if (arguments != null) command.addAll(arguments);
+        return run(cwd, command.toArray(new String[command.size()]));
+    }
 
-
-        if (candidates.isEmpty()) {
-            ArrayDeque<File> q = new ArrayDeque<File>();
-            q.add(buildRoot);
-            int depth = 0;
-            while (!q.isEmpty() && depth <= 3) {
-                int sz = q.size();
-                for (int i = 0; i < sz; i++) {
-                    File d = q.poll();
-                    File lib = new File(d, "build/libs");
-                    if (lib.isDirectory()) {
-                        File[] arr = lib.listFiles(new FilenameFilter() {
-                            public boolean accept(File dd, String n) {
-                                return n.endsWith(".jar");
-                            }
-                        });
-                        if (arr != null) Collections.addAll(candidates, arr);
-                    }
-                    File tgt = new File(d, "target");
-                    if (tgt.isDirectory()) {
-                        File[] arr = tgt.listFiles(new FilenameFilter() {
-                            public boolean accept(File dd, String n) {
-                                return n.endsWith(".jar");
-                            }
-                        });
-                        if (arr != null) Collections.addAll(candidates, arr);
-                    }
-                    File[] subs = d.listFiles(new FileFilter() {
-                        public boolean accept(File f) {
-                            return f.isDirectory();
-                        }
-                    });
-                    if (subs != null) Collections.addAll(q, subs);
-                }
-                depth++;
+    File pickBuiltJar(File buildRoot) {
+        try {
+            Path selected = selectBuiltPluginJar(buildRoot == null ? null : buildRoot.toPath());
+            return selected == null ? null : selected.toFile();
+        } catch (IOException selectionFailure) {
+            if (UpdateOptions.debug) {
+                logger.info("[DEBUG] Unable to inspect source-build outputs: "
+                        + selectionFailure.getMessage());
             }
+            return null;
         }
-
-        if (candidates.isEmpty()) return null;
-
-
-        List<File> filtered = new ArrayList<File>(candidates.size());
-        for (File f : candidates) {
-            String n = f.getName().toLowerCase(Locale.ROOT);
-            if (n.indexOf("-sources") >= 0) continue;
-            if (n.indexOf("-javadoc") >= 0) continue;
-            if (n.indexOf("original-") >= 0) continue;
-            if (n.indexOf("tests") >= 0) continue;
-            if (n.indexOf("test-fixtures") >= 0) continue;
-            filtered.add(f);
-        }
-        if (filtered.isEmpty()) filtered = candidates;
-
-
-        Collections.sort(filtered, new Comparator<File>() {
-            public int compare(File a, File b) {
-                int sa = scoreJar(a.getName().toLowerCase(Locale.ROOT));
-                int sb = scoreJar(b.getName().toLowerCase(Locale.ROOT));
-                return (sb - sa);
-            }
-        });
-
-        return filtered.get(0);
     }
 
     private int scoreJar(String n) {

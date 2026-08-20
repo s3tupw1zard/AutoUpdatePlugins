@@ -43,8 +43,9 @@
 
 ## Highlights
 
-* **One list, many sources.** Pull updates from GitHub Releases/Actions, Jenkins, SpigotMC (Spiget), dev.bukkit,
-  Modrinth, Hangar, BusyBiscuit, blob.build, Guizhanss v2, MineBBS, CurseForge, or any page with a direct `.jar` link.
+* **One list, many sources.** Pull updates from GitHub Releases/Actions, GitLab packages, Jenkins, PlaceholderAPI
+  eCloud, VoxelShop/Polymart, SpigotMC (Spiget), dev.bukkit, Modrinth, Hangar, BusyBiscuit, blob.build, Guizhanss v2,
+  MineBBS, CurseForge, or any page with a direct `.jar` link.
 * **Local sources.** Point at local jar files or run scripts that output a jar path for custom/patched builds.
 * **Smart file selection.** Use `?get=<regex>`, `[N]` (pick the N-th asset), `?artifact=2` / `?index=2` / `?zip=2` for
   GitHub Actions bundles, `?prerelease=true` (or `?pre-release=true`), `?alpha=true`, `?beta=true`, `?latest=true`,
@@ -64,6 +65,13 @@
 * **Cross-platform.** Works on **Spigot**, **Paper**, **Folia**, **Velocity**, **BungeeCord**.
 * **Safe updates.** Download ➜ validate ➜ atomic replace, staged through temp/update paths.
 * **Integrity + dedupe.** Optional zip integrity checks and MD5 comparison skip corrupted or unchanged downloads.
+* **Metadata-aware updates.** GitHub, GitLab, Jenkins, Modrinth, Hangar, eCloud, and VoxelShop skip unchanged payloads
+  before spending bandwidth; generic direct URLs can opt in to strong-validator HEAD checks.
+* **Compatibility and policy controls.** Filter Modrinth/Hangar by Minecraft version and limit each entry to patch,
+  same-major, any, or no automatic version transitions.
+* **Operator visibility.** Daily update history, `/aup log`, bounded installed-to-selected changelog ranges for
+  GitHub and Modrinth (with selected-release fallback elsewhere), pending-update details, and a paginated
+  Spigot/Paper/Folia inventory GUI.
 * **Rollback safety net.** Snapshot the previous jar and auto-restore if the new build fails to start.
 
 ---
@@ -75,7 +83,10 @@
 | Source                | Release/Build Discovery | Notes / Selectors Supported                                                                                            |
 |-----------------------|-------------------------|------------------------------------------------------------------------------------------------------------------------|
 | **GitHub**            | Releases & Actions      | `[N]`, `?artifact=2`, `?index=2`, `?zip=2`, `?get=regex`, `?prerelease=true`, `?pre-release=true`, `?alpha=true`, `?beta=true`, `?latest=true`, `?autobuild=true`, `?branch=dev` |
-| **Jenkins**           | Latest build artifacts  | `[N]`, `?get=regex`                                                                                                    |
+| **GitLab**            | Generic/Maven packages  | `[N]`, `?get=regex`, `?packageType=generic|maven`, `?packageName=...`, `?account=name`                                  |
+| **Jenkins**           | Latest successful build | Any HTTP(S) `/job/` URL; `[N]`, `?index=N`, `?get=regex`                                                               |
+| **PlaceholderAPI eCloud** | Expansion releases | ExtendedClip/eCloud expansion URL; installs to `plugins/PlaceholderAPI/expansions` by default                            |
+| **VoxelShop / Polymart** | Resource/update API  | Public resources auto-download; paid resources use `updates.voxelShopTokens.default` or `?account=name`, otherwise a manual action is queued |
 | **SpigotMC (Spiget)** | Resource page URL       | Auto-resolves latest                                                                                                   |
 | **dev.bukkit**        | Project page            | Auto-resolves latest                                                                                                   |
 | **Modrinth**          | Project/version URL     | `?get=regex`, `?loader=velocity`, `?platform=bungeecord`, `?alpha=true`, `?beta=true`, `?latest=true`                  |
@@ -85,7 +96,7 @@
 | **Guizhanss v2**      | Project index           | Auto-resolves                                                                                                          |
 | **MineBBS**           | Resource page           | Auto-resolves                                                                                                          |
 | **CurseForge**        | Project/files           | `?get=regex`                                                                                                           |
-| **Generic**           | Direct `.jar` link      | Exact file URL                                                                                                         |
+| **Generic**           | Direct `.jar` link      | Exact file URL; optional strong ETag/Last-Modified HEAD metadata                                                       |
 | **Local file**        | Local path              | `file:`, `local:`, `path:`, or absolute/relative path                                                                  |
 | **Local script**      | Script stdout path      | `script:` or `exec:` (script prints jar path to stdout)                                                                |
 
@@ -124,7 +135,8 @@
 4. Edit **`plugins/AutoUpdatePlugins/config.yml`** and **`plugins/AutoUpdatePlugins/list.yml`**.
 5. Run **`/update`** or **`/aup update`** (or restart) to kick off the first check.
 
-> **Velocity / BungeeCord:** Same process - drop the jar in `plugins/`, configure, then trigger an update run.
+> **Velocity / BungeeCord:** Same process, but management commands are `/vaup ...` and `/baup ...` respectively so
+> the proxy does not shadow a backend server's `/aup` command.
 
 ---
 
@@ -185,6 +197,11 @@ updates:
   key:
   # Optional named GitHub tokens. Use ?account=name on a GitHub entry to select one.
   githubTokens: {}
+  # Optional named GitLab PRIVATE-TOKEN values. Use ?account=name on a GitLab entry.
+  gitlabTokens: {}
+  # Optional VoxelShop user tokens for paid resources the account is entitled to.
+  # A "default" entry is used when the resource URL has no ?account=name selector.
+  voxelShopTokens: {}
 
 # HTTP configuration (optional)
 http:
@@ -246,7 +263,39 @@ behavior:
   # Entries where timeToRestart > restartDelaySec are skipped.
   restartCommands: [ ]
 
+# Lightweight provider metadata cache. Provider metadata is checked each run;
+# unchanged artifacts skip the large payload download.
+metadata:
+  enabled: true
+  file: "metadata.json"
+  ttlMinutes: 0
+  skipDownloadWhenUnchanged: true
+  # Opt in to lightweight HEAD metadata for generic direct URLs. Only strong ETags
+  # or Last-Modified are accepted; weak W/ ETags are ignored.
+  directUrlHeadMetadata: false
+  # Blank auto-detects on Spigot/Paper/Folia; set explicitly on proxies.
+  minecraftVersion: ""
 
+compatibility:
+  modrinthMinecraftVersionCheck: true
+  hangarMinecraftVersionCheck: true
+  strictMinecraftVersionMetadata: false
+
+versioning:
+  # any | patch (same X.Y) | same-major | none
+  policy: "any"
+  unknownVersionPolicy: "allow"
+  allowSameVersionSnapshotUpdates: true
+  allowSameVersionReleaseHashUpdates: false
+
+logging:
+  updates:
+    enabled: true
+    path: "logs"
+    filePattern: "yyyy-MM-dd'.log'"
+    commandPageSize: 8
+    includeUnchanged: false
+    includeChecks: true
 
 # Optional custom paths
 paths:
@@ -299,8 +348,8 @@ rollback:
 #   Geyser: "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot"
 #   EssentialsXChat: "https://github.com/EssentialsX/Essentials[3]"
 #
-# Supported sources: GitHub (Releases & Actions), Jenkins, SpigotMC (Spiget), dev.bukkit, Modrinth, Hangar,
-# BusyBiscuit, blob.build, Guizhanss v2, MineBBS, CurseForge, local file paths, local scripts, plus generic pages with direct .jar links.
+# Supported sources: GitHub, GitLab packages, Jenkins, PlaceholderAPI eCloud, SpigotMC, dev.bukkit, Modrinth,
+# Hangar, BusyBiscuit, blob.build, Guizhanss v2, MineBBS, CurseForge, local files/scripts, and direct .jar links.
 #
 # Tips:
 # - Select assets: append [N] to pick the Nth asset or use ?get=<regex> to match by filename.
@@ -309,10 +358,13 @@ rollback:
 # - Channel flags: ?beta=true, ?alpha=true, ?latest=true, or ?channel=Alpha/Beta for Hangar.
 # - Modrinth/Hangar obey the same flags (?alpha, ?beta, ?latest) to pick non-release builds when desired.
 # - Modrinth loader override: append ?loader=velocity or ?platform=bungeecord when the detected server platform is not the desired target.
+# - Compatibility: append ?versionCheck=true&mcVersion=1.21.8 (Spigot-family servers auto-detect by default).
+# - Version policy: append ?versionPolicy=patch|same-major|any|none; ?force=true bypasses policy/cache for one run.
 # - Groups are supported: add `GroupName:` and indent plugin entries beneath it.
 # - Per-entry install path override: append | plugins/SomeFolder/ (legacy) or | filePath=... | updatePath=... | useUpdateFolder=true
 # - Force source build from GitHub: append ?autobuild=true to a GitHub repo URL.
 # - Pick a non-default branch for GitHub source builds: append ?branch=dev (works with ?autobuild=true).
+# - Missing source-build libraries: repeat URL-encoded ?buildLib=group:artifact:version=<jar-url> declarations.
 
 ```
 
@@ -338,9 +390,15 @@ rollback:
 | `?latest=true`               | Same as `?prerelease=true`, but intended for explicit "always newest" behaviour      | GitHub, Modrinth, Hangar       |
 | `?channel=release|beta|alpha|latest` | Channel preference (works with Hangar channel names and release-tier preference) | Hangar, GitHub, Modrinth       |
 | `?loader=<name>` / `?platform=<name>` | Override the detected target loader/platform                                    | Modrinth                       |
+| `?versionCheck=true` / `?mcVersion=1.21.8` | Require an exact compatible Minecraft release                              | Modrinth, Hangar               |
+| `?versionPolicy=patch|same-major|any|none` | Limit the allowed local-to-remote version transition                         | Metadata-aware providers       |
+| `?force=true`                 | Bypass metadata cache and version policy for this run                               | Metadata-aware providers       |
+| `?cache=false`                | Disable metadata payload skipping for this entry                                    | Metadata-aware providers       |
 | `?autobuild=true`            | Trigger Gradle/Maven source builds when binaries are missing                         | GitHub                         |
 | `?branch=<name>`             | Build a specific GitHub branch instead of the default branch                         | GitHub                         |
-| `?account=<name>` / `?author=<name>` | Use `updates.githubTokens.<name>` instead of the default `updates.key`        | GitHub                         |
+| `?buildLib=group:artifact:version=<jar-url>` | Provision a missing Maven/Gradle dependency; repeat for multiple libraries | GitHub source builds           |
+| `?account=<name>`            | Select a provider-scoped named token instead of its fallback/default                 | GitHub, GitLab, VoxelShop      |
+| `?author=<name>`             | Alias for selecting a named token                                                     | GitHub, GitLab                 |
 | `?auto=true`                 | In manual mode, allow this entry to install during scheduled runs                    | All providers                  |
 
 **Key options explained**
@@ -349,6 +407,20 @@ rollback:
 * **`updates.key`** - GitHub PAT for Releases/Actions access and higher rate limits (especially useful for public repos
   under heavy use or any private repos).
 * **`updates.githubTokens`** - Optional named GitHub PATs selected per entry with `?account=name`; `updates.key` remains the fallback.
+* **`updates.gitlabTokens`** - Optional named GitLab `PRIVATE-TOKEN` values selected with `?account=name`; tokens are
+  sent in headers and stripped before cross-origin payload redirects.
+* **`updates.voxelShopTokens`** - Optional VoxelShop user tokens for entitled paid resources. The `default` key is used
+  without a selector; `?account=name` selects only that name from the VoxelShop map. Public resources need no token. A
+  paid resource stays pending with its product-page link when no token is configured or the API declines the download.
+* **`metadata`** - Persists lightweight provider release/build IDs and target hashes, avoiding repeat payload downloads
+  while invalidating the hit if the managed jar is replaced externally.
+* **`metadata.directUrlHeadMetadata`** - When enabled, generic HTTP(S) entries make a lightweight HEAD request before
+  downloading. A strong ETag or Last-Modified value can identify an unchanged payload; weak `W/` ETags are rejected,
+  and URLs without a usable validator fall back to the normal download-and-compare flow.
+* **`compatibility`** - Enables Minecraft-version filtering for Modrinth and Hangar. Proxies require
+  `metadata.minecraftVersion`; Spigot-family servers auto-detect it.
+* **`versioning`** - Controls version-transition policy globally; per-entry selectors override it.
+* **`logging.updates`** - Configures daily history files and chat pagination for the log command.
 * **`http.userAgents`** - Simple rotation to avoid brittle server-side filters.
 * **`proxy`** - Full support for HTTP/SOCKS proxies.
 * **`behavior.autoCompile`** - For GitHub repos: if there’s no release jar (or if the branch is newer than the last
@@ -450,9 +522,14 @@ Worldguard: https://dev.bukkit.org/projects/worldguard
 * **`?prerelease=true`** / **`?pre-release=true`** - Permit pre-releases.
 * **`?alpha=true`**, **`?beta=true`**, **`?latest=true`** - Fine-tune release channel preference.
 * **`?channel=release|beta|alpha|latest`** - Explicit channel preference (especially useful on Hangar).
+* **`?versionCheck=true&mcVersion=<version>`** - Require an exact Modrinth/Hangar Minecraft version match.
+* **`?versionPolicy=patch|same-major|any|none`** - Restrict allowed version transitions for one entry.
+* **`?force=true`** - Bypass metadata and version-policy skips for a deliberate one-off refresh.
 * **`?autobuild=true`** - Force a source build on GitHub even if a jar asset exists.
 * **`?branch=<name>`** - Use a specific GitHub branch for source builds/autobuild instead of the default branch.
-* **`?account=<name>`** - Use a named GitHub token from `updates.githubTokens`.
+* **`?buildLib=<coordinates>=<encoded-jar-url>`** - Supply a missing dependency to GitHub Maven/Gradle builds;
+  repeat the parameter for multiple libraries.
+* **`?account=<name>`** - Use a named GitHub, GitLab, or VoxelShop token from that provider's matching token map.
 * **`?auto=true`** - In manual mode, this entry still installs during scheduled runs while the rest are check-only.
 
 > **Pro tip:** Combine selectors, e.g. `...?prerelease=true&get=.*spigot.*\.jar`.
@@ -501,6 +578,9 @@ If cron is empty, the plugin uses **`interval`** (minutes) with an initial **`bo
 * **`/aup update [names|groups...]`** - Alias of `download`.
 * **`/aup check [names|groups...]`** - Check all, or only the selected plugins/groups, without installing them.
 * **`/aup pending`** - Show updates found during check-only runs that still need a manual install.
+* **`/aup log [today|yesterday|yyyy-MM-dd|page] [page]`** - Read paginated update history.
+* **`/aup gui [page]`** - Open the paginated inventory manager on Spigot/Paper/Folia. Left-click checks,
+  shift-left installs, and right-click enables/disables an entry.
 * **`/aup stop`** - Request to stop the current updating process.
 * **`/aup reload`** - Reload the plugin configuration.
 * **`/aup add <name> <link>`** - Add a new entry to `list.yml`.
@@ -514,6 +594,9 @@ If cron is empty, the plugin uses **`interval`** (minutes) with an initial **`bo
 * `autoupdateplugins.update` - Allows `/update`.
 * `autoupdateplugins.manage` - Allows `/aup ...` commands.
 
+> On Velocity use `/vaup ...`; on BungeeCord use `/baup ...`. These proxy-only names intentionally leave backend
+> `/aup` available to connected players. Inventory GUI commands are available only on Spigot/Paper/Folia.
+
 > **Heads-up:** Most servers still require a **restart** to load updated jars. The plugin handles download & staging;
 > you decide when to reboot (auto-restart available via `behavior.restartAfterUpdate`).
 
@@ -521,14 +604,19 @@ If cron is empty, the plugin uses **`interval`** (minutes) with an initial **`bo
 
 ## How It Works (Under the Hood)
 
-1. **Discovery.** For each entry in `list.yml`, the plugin detects the provider (GitHub, Jenkins, SpigotMC, etc.) and
-   computes the **latest matching artifact** using your selectors.
-2. **Download (async).** Files are fetched with pooled connections; on Java 11+ it uses the HTTP/2 client; on Java 21+
+1. **Discovery.** For each entry in `list.yml`, the plugin detects the provider and computes the latest matching,
+   policy-allowed, platform-compatible artifact using your selectors.
+2. **Metadata preflight.** Provider release/build IDs are compared with `metadata.json`; an unchanged target skips the
+   payload entirely. Changing the selected asset, target path, managed jar, or using `?force=true` invalidates the hit.
+3. **Download (async).** Files are fetched with pooled connections; on Java 11+ it uses the HTTP/2 client; on Java 21+
    it schedules downloads on virtual threads when available.
-3. **Validation.** Optional **zip integrity** checks and duplicate detection (`name + size`) avoid unnecessary writes.
-4. **Staging & Atomic Replace.** Files are written to a **temp** directory, then moved atomically into the *
-   *update/plugins** target so the server is never left in a partial state.
-5. **Repeat.** According to your **interval** or **cron** schedule, with retries/backoff on transient failures.
+4. **Validation.** Provider size/checksums, JAR integrity, plugin metadata, and duplicate hashes are checked before a
+   managed target can be changed.
+5. **Staging & Atomic Replace.** Files are written to a **temp** directory, then moved atomically into the
+   **update/plugins** target so the server is never left in a partial state.
+6. **Record.** Cache state and daily update/check/failure history are persisted, including bounded
+   installed-to-selected GitHub/Modrinth changelog ranges and selected-release notes from other providers.
+7. **Repeat.** According to your **interval** or **cron** schedule, with retries/backoff on transient failures.
 
 ---
 
@@ -548,13 +636,36 @@ If cron is empty, the plugin uses **`interval`** (minutes) with an initial **`bo
   MyActionsPluginSource: "https://github.com/Owner/MyActionsPlugin?autobuild=true"
   MyActionsPluginDev: "https://github.com/Owner/MyActionsPlugin?autobuild=true&branch=dev"
   ```
-* **Jenkins (match shaded jar; select by index with `[N]`):**
+* **Jenkins (any Jenkins job host; match a shaded jar or select by index):**
 
   ```
   CoolThing: "https://ci.example.com/job/CoolThing/lastSuccessfulBuild/artifact/?get=.*-all\\.jar"
   # second artifact
   CoolThingAlt: "https://ci.example.com/job/CoolThing/lastSuccessfulBuild/artifact/[2]"
   ```
+* **GitLab package registry (named token is optional for public projects):**
+
+  ```
+  OpenCreative: "https://gitlab.com/eagles-creative/opencreative/-/packages?packageType=maven&get=.*\.jar&account=gitlab-main"
+  ```
+* **PlaceholderAPI eCloud / ExtendedClip expansion:**
+
+  ```
+  LocalTimeExpansion: "https://api.extendedclip.com/expansions/localtime/"
+  ```
+* **VoxelShop / legacy Polymart resource URLs:**
+
+  ```
+  # Public resource: the official API supplies a signed download URL without a token.
+  PublicResource: "https://voxel.shop/product/12345"
+  # Paid resource: selects updates.voxelShopTokens.voxel-main.
+  PaidResource: "https://voxel.shop/product/67890?account=voxel-main"
+  # Existing polymart.org resource links are accepted during the VoxelShop transition.
+  LegacyResource: "https://polymart.org/resource/example-plugin.12345"
+  ```
+
+  A paid resource without an authorized token is kept as a pending manual action with its VoxelShop product link; the
+  updater does not claim to bypass marketplace purchase or entitlement checks.
 * **SpigotMC (resource page):**
 
   ```
@@ -606,6 +717,11 @@ If cron is empty, the plugin uses **`interval`** (minutes) with an initial **`bo
   ```
   PatchedPlugin: "script:./scripts/build-plugin.sh"
   ```
+* **GitHub source build with a manually supplied library:**
+
+  ```
+  CustomBuild: "https://github.com/Owner/Project?autobuild=true&buildLib=com.example:api:1.0=https%3A%2F%2Fexample.com%2Fapi-1.0.jar"
+  ```
 
 ---
 
@@ -621,6 +737,23 @@ Releases/Actions artifacts.
 
 **Q: Different GitHub repos need different tokens.**
 A: Add named tokens under `updates.githubTokens`, then add `?account=name` to the matching GitHub entry. If the account is missing, `updates.key` is used.
+
+**Q: How do private GitLab package registries work?**
+A: Put a least-privileged token under `updates.gitlabTokens.<name>` and add `?account=name` to the project/packages URL.
+Generic and Maven package registries are supported; use `?packageType=` and `?get=` when a project publishes several jars.
+
+**Q: How do paid VoxelShop resources work?**
+A: Add the VoxelShop user token for an account that already owns the resource under
+`updates.voxelShopTokens.default`, or use a named entry and add `?account=name` to that VoxelShop/Polymart resource URL.
+Public resources do not need a token. Missing or rejected authorization produces a pending manual-download action.
+
+**Q: Why did the updater skip the payload?**
+A: A metadata-aware provider returned the same release/build and the managed target still matched its cached hash. Use
+`?force=true` for a deliberate refresh or `?cache=false` for that entry.
+
+For generic direct URLs, `metadata.directUrlHeadMetadata: true` enables the same early skip only when HEAD returns a
+strong ETag or Last-Modified. Weak `W/` ETags and responses without a stable validator fall back to downloading and
+comparing the payload.
 
 **Q: Wrong file selected.**
 A: Add a **`?get=regex`** or use **`[N]`** to pick an asset index. Confirm the regex escapes dots (e.g., `\\.jar`).
@@ -659,10 +792,19 @@ The built `.jar` will be in `target/`.
 
 ## Security Notes
 
-* Prefer **least-privileged tokens**. For GitHub, use a PAT limited to the repos you need with read permissions
-  sufficient for Releases/Actions artifacts.
+* Prefer **least-privileged tokens**. Limit GitHub and GitLab credentials to read access for only the repositories and
+  package registries you need. They are sent in request headers, never embedded in generated URLs, and are removed
+  before a payload follows a cross-origin redirect.
+* Store VoxelShop tokens only for accounts entitled to the paid resources you manage. The token is submitted to the
+  official VoxelShop API, whose redirects must remain same-origin; it is not added to the returned signed payload URL or
+  forwarded with that download. Public resources do not use a token.
+* Optional direct-URL HEAD metadata rejects HTTPS-to-HTTP downgrades, strips configured headers after a cross-origin
+  redirect, and never treats weak `W/` ETags as stable cache identities.
 * Treat third-party download links as untrusted: keep `zipFileCheck: true`.
 * Consider pinning sources with `?get=regex` to avoid accidentally switching to platform-incompatible jars.
+* Source builds execute repository-provided Gradle/Maven wrappers and therefore run third-party build code. Enable
+  `behavior.autoCompile` only for repositories you trust; manually supplied `buildLib` jars are isolated and validated
+  as archives but are still executable dependencies.
 
 ---
 

@@ -9,9 +9,9 @@ commands:
     usage: /update
     permission: autoupdateplugins.update
     permission-message: You don't have the permission <permission>
-  aup:
+  baup:
     description: Manage AutoUpdatePlugins
-    usage: /aup <subcommand>
+    usage: /baup <subcommand>
     permission: autoupdateplugins.manage
 permissions:
   autoupdateplugins.update:

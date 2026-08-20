@@ -76,6 +76,17 @@ public class ConfigManager {
         loadConfig();
     }
 
+    /** Reload this manager in place so long-lived command objects keep a live configuration reference. */
+    public synchronized void reloadConfig() {
+        commentMap.clear();
+        processedPaths.clear();
+        originalContent = null;
+        lineSeparator = System.lineSeparator();
+        leadingComments = "";
+        trailingComments = "";
+        loadConfig();
+    }
+
     private void loadConfig() {
         if (configFile.exists()) {
             try {
@@ -83,12 +94,12 @@ public class ConfigManager {
                 lineSeparator = detectLineSeparator(rawContent);
                 originalContent = normalizeToLf(rawContent);
                 Load loader = new Load(loadSettings);
-                configMap = toLinkedMap((Map<String, Object>) loader.loadFromString(originalContent));
-                if (configMap == null) {
-                    configMap = new LinkedHashMap<>();
-                }
+                Object loaded = loader.loadFromString(originalContent);
+                if (loaded == null) configMap = new LinkedHashMap<>();
+                else if (loaded instanceof Map) configMap = toLinkedMap((Map<String, Object>) loaded);
+                else throw new IllegalArgumentException("configuration root must be a mapping");
                 extractExistingComments();
-            } catch (IOException e) {
+            } catch (Exception e) {
                 System.err.println("Could not load config: " + e.getMessage());
                 configMap = new LinkedHashMap<>();
             }

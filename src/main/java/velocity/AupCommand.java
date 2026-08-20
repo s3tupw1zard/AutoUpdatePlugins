@@ -3,8 +3,10 @@ package velocity;
 import com.velocitypowered.api.command.CommandSource;
 import com.velocitypowered.api.command.SimpleCommand;
 import common.ConfigManager;
+import common.HistoryCommandSupport;
 import common.ListEntryLoader;
 import common.PluginUpdater;
+import common.UpdateHistoryLogger;
 import common.UpdateOptions;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -59,11 +61,14 @@ public class AupCommand implements SimpleCommand {
             case "pending":
                 showPending(source);
                 break;
+            case "log":
+                showHistory(source, Arrays.copyOfRange(args, 1, args.length));
+                break;
             case "add":
                 if (args.length >= 3) {
                     addPlugin(source, args[1], joinArgs(args, 2));
                 } else {
-                    source.sendMessage(error("Usage: /aup add <identifier> <link>"));
+                    source.sendMessage(error("Usage: /vaup add <identifier> <link>"));
                 }
                 break;
             case "stop":
@@ -76,7 +81,7 @@ public class AupCommand implements SimpleCommand {
                 if (args.length >= 2) {
                     removePlugins(source, args[1]);
                 } else {
-                    source.sendMessage(error("Usage: /aup remove <identifier|group>"));
+                    source.sendMessage(error("Usage: /vaup remove <identifier|group>"));
                 }
                 break;
             case "list":
@@ -93,14 +98,14 @@ public class AupCommand implements SimpleCommand {
                 if (args.length >= 2) {
                     setEnabled(source, args[1], true);
                 } else {
-                    source.sendMessage(error("Usage: /aup enable <identifier|group>"));
+                    source.sendMessage(error("Usage: /vaup enable <identifier|group>"));
                 }
                 break;
             case "disable":
                 if (args.length >= 2) {
                     setEnabled(source, args[1], false);
                 } else {
-                    source.sendMessage(error("Usage: /aup disable <identifier|group>"));
+                    source.sendMessage(error("Usage: /vaup disable <identifier|group>"));
                 }
                 break;
             case "debug":
@@ -114,17 +119,18 @@ public class AupCommand implements SimpleCommand {
 
     private void sendHelp(CommandSource source) {
         source.sendMessage(info("AutoUpdatePlugins Commands:"));
-        source.sendMessage(info("/aup update [plugin|group...]"));
-        source.sendMessage(info("/aup check [plugin|group...]"));
-        source.sendMessage(info("/aup pending"));
-        source.sendMessage(info("/aup stop"));
-        source.sendMessage(info("/aup reload"));
-        source.sendMessage(info("/aup debug <on|off|toggle|status>"));
-        source.sendMessage(info("/aup add <identifier> <link>"));
-        source.sendMessage(info("/aup remove <identifier|group>"));
-        source.sendMessage(info("/aup list [page]"));
-        source.sendMessage(info("/aup enable <identifier|group>"));
-        source.sendMessage(info("/aup disable <identifier|group>"));
+        source.sendMessage(info("/vaup update [plugin|group...]"));
+        source.sendMessage(info("/vaup check [plugin|group...]"));
+        source.sendMessage(info("/vaup pending"));
+        source.sendMessage(info("/vaup log [today|yesterday|yyyy-MM-dd|page] [page]"));
+        source.sendMessage(info("/vaup stop"));
+        source.sendMessage(info("/vaup reload"));
+        source.sendMessage(info("/vaup debug <on|off|toggle|status>"));
+        source.sendMessage(info("/vaup add <identifier> <link>"));
+        source.sendMessage(info("/vaup remove <identifier|group>"));
+        source.sendMessage(info("/vaup list [page]"));
+        source.sendMessage(info("/vaup enable <identifier|group>"));
+        source.sendMessage(info("/vaup disable <identifier|group>"));
         source.sendMessage(Component.text("Use group:<name> to target a group explicitly.").color(NamedTextColor.GRAY));
     }
 
@@ -132,6 +138,28 @@ public class AupCommand implements SimpleCommand {
         boolean stopped = pluginUpdater.stopUpdates();
         source.sendMessage(Component.text(stopped ? "Stop requested. In-flight downloads may complete." : "No update is currently running.")
                 .color(stopped ? NamedTextColor.YELLOW : NamedTextColor.RED));
+    }
+
+    private void showHistory(CommandSource source, String[] args) {
+        HistoryCommandSupport.Request request = HistoryCommandSupport.parse(args);
+        if (!request.valid) {
+            source.sendMessage(error(request.error.replace("/aup", "/vaup")));
+            return;
+        }
+        UpdateHistoryLogger.Page history = pluginUpdater.readHistory(request.day, request.page);
+        if (history == null) {
+            source.sendMessage(error("Update history is unavailable."));
+            return;
+        }
+        source.sendMessage(info("AutoUpdatePlugins log " + history.day
+                + ", page " + history.page + "/" + history.totalPages));
+        if (history.lines.isEmpty()) {
+            source.sendMessage(Component.text("No update history for this date.").color(NamedTextColor.YELLOW));
+            return;
+        }
+        for (String line : history.lines) {
+            source.sendMessage(Component.text(HistoryCommandSupport.compactLine(line)).color(NamedTextColor.GRAY));
+        }
     }
 
     private void reloadConfig(CommandSource source) {
@@ -154,7 +182,7 @@ public class AupCommand implements SimpleCommand {
         else if ("off".equalsIgnoreCase(args[0])) next = false;
         else if ("toggle".equalsIgnoreCase(args[0])) next = !current;
         else {
-            sender.sendMessage(error("Usage: /aup debug <on|off|toggle|status>"));
+            sender.sendMessage(error("Usage: /vaup debug <on|off|toggle|status>"));
             return;
         }
         UpdateOptions.debug = next;
@@ -216,7 +244,19 @@ public class AupCommand implements SimpleCommand {
         }
         source.sendMessage(info("Pending updates (" + pending.size() + "):"));
         for (PluginUpdater.PendingUpdate update : pending.values()) {
-            source.sendMessage(Component.text(update.pluginName + " -> /aup update " + update.pluginName).color(NamedTextColor.YELLOW));
+            String details = update.versionAndProvider();
+            source.sendMessage(Component.text(update.pluginName
+                    + (details.isEmpty() ? "" : " (" + details + ")")
+                    + (update.requiresManualAction()
+                    ? " -> manual download required" : " -> /vaup update " + update.pluginName))
+                    .color(NamedTextColor.YELLOW));
+            if (update.requiresManualAction()) {
+                source.sendMessage(Component.text("  " + update.manualReason).color(NamedTextColor.GRAY));
+                source.sendMessage(Component.text("  " + update.actionUrl).color(NamedTextColor.AQUA));
+            }
+            if (update.changelogPreview() != null) {
+                source.sendMessage(Component.text("  Changelog: " + update.changelogPreview()).color(NamedTextColor.GRAY));
+            }
         }
     }
 
@@ -451,7 +491,7 @@ public class AupCommand implements SimpleCommand {
         source.sendMessage(info("Check complete: " + summary.available + " available, " + summary.unchanged + " unchanged, " + summary.failed + " failed."));
         if (summary.available > 0) {
             source.sendMessage(Component.text("Available: " + summarizeNames(summary.namesFor(PluginUpdater.EntryResult.AVAILABLE))).color(NamedTextColor.YELLOW));
-            source.sendMessage(Component.text("Run /aup pending or /aup update <name|group>.").color(NamedTextColor.GRAY));
+            source.sendMessage(Component.text("Run /vaup pending or /vaup update <name|group>.").color(NamedTextColor.GRAY));
         }
         if (summary.failed > 0) {
             source.sendMessage(Component.text("Failed: " + summarizeNames(summary.namesFor(PluginUpdater.EntryResult.FAILED))).color(NamedTextColor.RED));
@@ -482,7 +522,7 @@ public class AupCommand implements SimpleCommand {
             return completions;
         }
         String[] args = invocation.arguments();
-        String[] subs = {"download", "update", "check", "pending", "stop", "reload", "add", "remove", "list", "enable", "disable", "debug"};
+        String[] subs = {"download", "update", "check", "pending", "log", "stop", "reload", "add", "remove", "list", "enable", "disable", "debug"};
         if (args.length == 0) {
             completions.addAll(Arrays.asList(subs));
             return completions;
@@ -510,9 +550,29 @@ public class AupCommand implements SimpleCommand {
                     String page = Integer.toString(i);
                     if (page.startsWith(args[1])) completions.add(page);
                 }
+            } else if ("log".equals(sub)) {
+                completions.addAll(HistoryCommandSupport.dateSuggestions(args[1],
+                        pluginUpdater.recentHistoryDays(7)));
+                HistoryCommandSupport.Request today = HistoryCommandSupport.parse(new String[0]);
+                UpdateHistoryLogger.Page todayHistory = pluginUpdater.readHistory(today.day, 1);
+                if (todayHistory != null) {
+                    for (String page : HistoryCommandSupport.pageSuggestions(args[1], todayHistory.totalPages)) {
+                        if (!completions.contains(page)) completions.add(page);
+                    }
+                }
             }
-        } else if (args.length > 2 && Arrays.asList("download", "update", "check").contains(sub)) {
-            completions.addAll(selectorSuggestions(args[args.length - 1], ListEntryLoader.SuggestionMode.ENABLED));
+        } else if (args.length > 2) {
+            if (Arrays.asList("download", "update", "check").contains(sub)) {
+                completions.addAll(selectorSuggestions(args[args.length - 1], ListEntryLoader.SuggestionMode.ENABLED));
+            } else if ("log".equals(sub) && args.length == 3) {
+                HistoryCommandSupport.Request request = HistoryCommandSupport.parse(new String[]{args[1]});
+                if (request.valid) {
+                    UpdateHistoryLogger.Page history = pluginUpdater.readHistory(request.day, 1);
+                    if (history != null) {
+                        completions.addAll(HistoryCommandSupport.pageSuggestions(args[2], history.totalPages));
+                    }
+                }
+            }
         }
         return completions;
     }

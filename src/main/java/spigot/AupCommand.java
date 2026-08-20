@@ -1,8 +1,10 @@
 package spigot;
 
 import common.ConfigManager;
+import common.HistoryCommandSupport;
 import common.ListEntryLoader;
 import common.PluginUpdater;
+import common.UpdateHistoryLogger;
 import common.UpdateOptions;
 import org.bukkit.Bukkit;
 import org.bukkit.ChatColor;
@@ -30,8 +32,9 @@ public class AupCommand implements CommandExecutor, TabCompleter {
     private final Runnable reloadAction;
     private final Runnable updateAllAction;
     private final Consumer<Runnable> completionDispatcher;
+    private final AupGui gui;
 
-    public AupCommand(PluginUpdater pluginUpdater, File listFile, FileConfiguration config, Supplier<String> keySupplier, ConfigManager cfgMgr, Runnable reloadAction, Runnable updateAllAction, Consumer<Runnable> completionDispatcher) {
+    public AupCommand(PluginUpdater pluginUpdater, File listFile, FileConfiguration config, Supplier<String> keySupplier, ConfigManager cfgMgr, Runnable reloadAction, Runnable updateAllAction, Consumer<Runnable> completionDispatcher, AupGui gui) {
         this.pluginUpdater = pluginUpdater;
         this.listFile = listFile;
         this.config = config;
@@ -40,6 +43,7 @@ public class AupCommand implements CommandExecutor, TabCompleter {
         this.reloadAction = reloadAction;
         this.updateAllAction = updateAllAction;
         this.completionDispatcher = completionDispatcher;
+        this.gui = gui;
     }
 
     @Override
@@ -63,6 +67,12 @@ public class AupCommand implements CommandExecutor, TabCompleter {
                 break;
             case "pending":
                 showPending(sender);
+                break;
+            case "log":
+                showHistory(sender, Arrays.copyOfRange(args, 1, args.length));
+                break;
+            case "gui":
+                openGui(sender, Arrays.copyOfRange(args, 1, args.length));
                 break;
             case "debug":
                 toggleDebug(sender, Arrays.copyOfRange(args, 1, args.length));
@@ -123,6 +133,8 @@ public class AupCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage(ChatColor.AQUA + "/aup update [plugin|group...]" + ChatColor.GRAY + " - Install specific or all plugins");
         sender.sendMessage(ChatColor.AQUA + "/aup check [plugin|group...]" + ChatColor.GRAY + " - Check for updates without installing");
         sender.sendMessage(ChatColor.AQUA + "/aup pending" + ChatColor.GRAY + " - Show pending manual updates");
+        sender.sendMessage(ChatColor.AQUA + "/aup log [today|yesterday|yyyy-MM-dd|page] [page]" + ChatColor.GRAY + " - Show update history");
+        sender.sendMessage(ChatColor.AQUA + "/aup gui [page]" + ChatColor.GRAY + " - Open the plugin management GUI");
         sender.sendMessage(ChatColor.AQUA + "/aup stop" + ChatColor.GRAY + " - Stop current updating process");
         sender.sendMessage(ChatColor.AQUA + "/aup reload" + ChatColor.GRAY + " - Reload plugin configuration");
         sender.sendMessage(ChatColor.AQUA + "/aup debug <on|off|toggle|status>" + ChatColor.GRAY + " - Verbose debug logging");
@@ -134,10 +146,56 @@ public class AupCommand implements CommandExecutor, TabCompleter {
         sender.sendMessage(ChatColor.GRAY + "Use group:<name> to target a group explicitly.");
     }
 
+    private void openGui(CommandSender sender, String[] args) {
+        if (gui == null) {
+            sender.sendMessage(ChatColor.RED + "The inventory GUI is unavailable.");
+            return;
+        }
+        int page = 1;
+        if (args.length > 1) {
+            sender.sendMessage(ChatColor.RED + "Usage: /aup gui [page]");
+            return;
+        }
+        if (args.length == 1) {
+            try {
+                page = Integer.parseInt(args[0]);
+                if (page < 1) {
+                    throw new NumberFormatException("page must be positive");
+                }
+            } catch (NumberFormatException ignored) {
+                sender.sendMessage(ChatColor.RED + "Usage: /aup gui [page]");
+                return;
+            }
+        }
+        gui.open(sender, page);
+    }
+
     private void stopUpdating(CommandSender sender) {
         boolean stopped = pluginUpdater.stopUpdates();
         if (stopped) sender.sendMessage(ChatColor.YELLOW + "Stop requested. In-flight downloads may complete.");
         else sender.sendMessage(ChatColor.RED + "No update is currently running.");
+    }
+
+    private void showHistory(CommandSender sender, String[] args) {
+        HistoryCommandSupport.Request request = HistoryCommandSupport.parse(args);
+        if (!request.valid) {
+            sender.sendMessage(ChatColor.RED + request.error);
+            return;
+        }
+        UpdateHistoryLogger.Page history = pluginUpdater.readHistory(request.day, request.page);
+        if (history == null) {
+            sender.sendMessage(ChatColor.RED + "Update history is unavailable.");
+            return;
+        }
+        sender.sendMessage(ChatColor.AQUA + "AutoUpdatePlugins log " + history.day
+                + ", page " + history.page + "/" + history.totalPages);
+        if (history.lines.isEmpty()) {
+            sender.sendMessage(ChatColor.YELLOW + "No update history for this date.");
+            return;
+        }
+        for (String line : history.lines) {
+            sender.sendMessage(ChatColor.GRAY + HistoryCommandSupport.compactLine(line));
+        }
     }
 
     private void reloadConfig(CommandSender sender) {
@@ -223,7 +281,18 @@ public class AupCommand implements CommandExecutor, TabCompleter {
         }
         sender.sendMessage(ChatColor.AQUA + "Pending updates (" + pending.size() + "):");
         for (PluginUpdater.PendingUpdate update : pending.values()) {
-            sender.sendMessage(ChatColor.YELLOW + update.pluginName + ChatColor.GRAY + " -> /aup update " + update.pluginName);
+            String details = update.versionAndProvider();
+            sender.sendMessage(ChatColor.YELLOW + update.pluginName
+                    + (details.isEmpty() ? "" : ChatColor.GRAY + " (" + details + ")")
+                    + ChatColor.GRAY + (update.requiresManualAction()
+                    ? " -> manual download required" : " -> /aup update " + update.pluginName));
+            if (update.requiresManualAction()) {
+                sender.sendMessage(ChatColor.GRAY + "  " + update.manualReason);
+                sender.sendMessage(ChatColor.AQUA + "  " + update.actionUrl);
+            }
+            if (update.changelogPreview() != null) {
+                sender.sendMessage(ChatColor.DARK_GRAY + "  Changelog: " + ChatColor.GRAY + update.changelogPreview());
+            }
         }
     }
 
@@ -507,7 +576,7 @@ public class AupCommand implements CommandExecutor, TabCompleter {
         if (!sender.hasPermission("autoupdateplugins.manage")) {
             return completions;
         }
-        String[] subs = {"download", "update", "check", "pending", "stop", "reload", "add", "remove", "list", "enable", "disable", "debug"};
+        String[] subs = {"download", "update", "check", "pending", "log", "gui", "stop", "reload", "add", "remove", "list", "enable", "disable", "debug"};
         if (args.length == 1) {
             String current = args[0].toLowerCase(Locale.ROOT);
             for (String sub : subs) {
@@ -533,11 +602,35 @@ public class AupCommand implements CommandExecutor, TabCompleter {
                     String page = Integer.toString(i);
                     if (page.startsWith(args[1])) completions.add(page);
                 }
+            } else if ("gui".equals(sub)) {
+                int pages = AupGui.totalPages(loadEntries().size());
+                for (int i = 1; i <= pages; i++) {
+                    String page = Integer.toString(i);
+                    if (page.startsWith(args[1])) completions.add(page);
+                }
+            } else if ("log".equals(sub)) {
+                completions.addAll(HistoryCommandSupport.dateSuggestions(args[1],
+                        pluginUpdater.recentHistoryDays(7)));
+                HistoryCommandSupport.Request today = HistoryCommandSupport.parse(new String[0]);
+                UpdateHistoryLogger.Page todayHistory = pluginUpdater.readHistory(today.day, 1);
+                if (todayHistory != null) {
+                    for (String page : HistoryCommandSupport.pageSuggestions(args[1], todayHistory.totalPages)) {
+                        if (!completions.contains(page)) completions.add(page);
+                    }
+                }
             }
         } else if (args.length > 2) {
             String sub = args[0].toLowerCase(Locale.ROOT);
             if (Arrays.asList("download", "update", "check").contains(sub)) {
                 completions.addAll(selectorSuggestions(args[args.length - 1], ListEntryLoader.SuggestionMode.ENABLED));
+            } else if ("log".equals(sub) && args.length == 3) {
+                HistoryCommandSupport.Request request = HistoryCommandSupport.parse(new String[]{args[1]});
+                if (request.valid) {
+                    UpdateHistoryLogger.Page history = pluginUpdater.readHistory(request.day, 1);
+                    if (history != null) {
+                        completions.addAll(HistoryCommandSupport.pageSuggestions(args[2], history.totalPages));
+                    }
+                }
             }
         }
         return completions;
@@ -550,16 +643,15 @@ public class AupCommand implements CommandExecutor, TabCompleter {
             return "folia";
         }
 
+        if (hasClass("org.purpurmc.purpur.PurpurConfig")
+                || containsIgnoreCase(Bukkit.getVersion(), "purpur")) return "purpur";
+
         if (hasClass("io.papermc.paper.configuration.Configuration")
                 || hasClass("com.destroystokyo.paper.PaperConfig")
                 || containsIgnoreCase(Bukkit.getServer().getName(), "paper")
                 || containsIgnoreCase(Bukkit.getVersion(), "paper")) {
             return "paper";
         }
-
-        if (hasClass("org.purpurmc.purpur.PurpurConfig")
-                || containsIgnoreCase(Bukkit.getVersion(), "purpur")) return "purpur";
-
 
         if (hasClass("org.spigotmc.SpigotConfig")
                 || containsIgnoreCase(Bukkit.getServer().getName(), "spigot")
