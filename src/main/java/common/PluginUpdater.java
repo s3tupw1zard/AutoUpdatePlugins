@@ -263,6 +263,14 @@ public class PluginUpdater {
     PluginUpdater(Logger logger, Path dataFolder, ModrinthProvider modrinthProvider,
                   HangarProvider hangarProvider, ExtendedClipProvider extendedClipProvider,
                   GitLabProvider gitLabProvider, VoxelShopProvider voxelShopProvider) {
+        this(logger, dataFolder, modrinthProvider, hangarProvider, extendedClipProvider,
+                gitLabProvider, new GitHubProvider(logger), voxelShopProvider);
+    }
+
+    PluginUpdater(Logger logger, Path dataFolder, ModrinthProvider modrinthProvider,
+                  HangarProvider hangarProvider, ExtendedClipProvider extendedClipProvider,
+                  GitLabProvider gitLabProvider, GitHubProvider gitHubProvider,
+                  VoxelShopProvider voxelShopProvider) {
         this.logger = logger;
         this.dataFolder = dataFolder == null ? null : dataFolder.toAbsolutePath().normalize();
         pluginDownloader = new PluginDownloader(logger);
@@ -270,7 +278,7 @@ public class PluginUpdater {
         this.hangarProvider = hangarProvider;
         this.extendedClipProvider = extendedClipProvider;
         this.gitLabProvider = gitLabProvider;
-        this.gitHubProvider = new GitHubProvider(logger);
+        this.gitHubProvider = gitHubProvider;
         this.jenkinsProvider = new JenkinsProvider(logger);
         this.directUrlProvider = new DirectUrlProvider();
         this.voxelShopProvider = voxelShopProvider;

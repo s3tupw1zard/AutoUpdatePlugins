@@ -21,7 +21,9 @@ updates:
 
   # Optional GitHub personal access token (PAT). Strongly recommended if you use
   # many GitHub links to avoid API rate-limits when listing releases/artifacts.
-  # Scope: public_repo is enough for public repos.
+  # Private release assets need repository Contents: read access. Private Actions
+  # artifacts also need Actions: read. A classic PAT needs the repo scope.
+  # Keep tokens here; never put them in list.yml URLs or commit them to source control.
   # Generate a token: https://github.com/settings/tokens
   key:
   # Optional named GitHub tokens. Use ?account=name on a GitHub entry to select one.

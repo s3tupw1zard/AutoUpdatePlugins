@@ -1,6 +1,6 @@
 <div align="center">
 
-# **AutoUpdatePlugins v12.2.0**
+# **AutoUpdatePlugins v12.3.0**
 
 *Keep your server’s plugins up-to-date - automatically, safely, and across platforms.*
 
@@ -192,7 +192,9 @@ updates:
 
   # Optional GitHub personal access token (PAT). Strongly recommended if you use
   # many GitHub links to avoid API rate-limits when listing releases/artifacts.
-  # Scope: public_repo is enough for public repos.
+  # Private release assets need repository Contents: read access. Private Actions
+  # artifacts also need Actions: read. A classic PAT needs the repo scope.
+  # Keep tokens here; never put them in list.yml URLs or commit them to source control.
   # Generate a token: https://github.com/settings/tokens
   key:
   # Optional named GitHub tokens. Use ?account=name on a GitHub entry to select one.
@@ -404,9 +406,11 @@ rollback:
 **Key options explained**
 
 * **`updates.schedule.cron` + `timezone`** - When set, cron **overrides** `interval`/`bootTime`.
-* **`updates.key`** - GitHub PAT for Releases/Actions access and higher rate limits (especially useful for public repos
-  under heavy use or any private repos).
-* **`updates.githubTokens`** - Optional named GitHub PATs selected per entry with `?account=name`; `updates.key` remains the fallback.
+* **`updates.key`** - Default GitHub PAT for Releases/Actions access and higher rate limits. A fine-grained token for a
+  private release needs access to that repository with **Contents: read**; private Actions artifacts also need
+  **Actions: read**. A classic PAT needs the `repo` scope for private repositories.
+* **`updates.githubTokens`** - Optional named GitHub PATs selected per entry with `?account=name`; `updates.key` remains
+  the fallback. Store tokens only in the runtime `config.yml`, never in `list.yml` or a source URL.
 * **`updates.gitlabTokens`** - Optional named GitLab `PRIVATE-TOKEN` values selected with `?account=name`; tokens are
   sent in headers and stripped before cross-origin payload redirects.
 * **`updates.voxelShopTokens`** - Optional VoxelShop user tokens for entitled paid resources. The `default` key is used
@@ -731,9 +735,11 @@ If cron is empty, the plugin uses **`interval`** (minutes) with an initial **`bo
 A: Most platforms load jars only at startup. **Restart** your server after a run. Avoid hot-reloaders for complex
 plugins.
 
-**Q: GitHub rate-limited / cannot access Actions artifacts.**
-A: Add a **GitHub PAT** in `config.yml` → `updates.key`. For private repos, ensure the token has read access to
-Releases/Actions artifacts.
+**Q: GitHub rate-limited or a private release asset cannot be downloaded.**
+A: Add a **GitHub PAT** in `config.yml` → `updates.key`. For a fine-grained token, select the private repository and
+grant **Contents: read**. Add **Actions: read** only when downloading private workflow artifacts. A classic PAT needs
+the `repo` scope for private repositories. The token is sent to GitHub's release-asset API and removed before a
+cross-origin payload redirect.
 
 **Q: Different GitHub repos need different tokens.**
 A: Add named tokens under `updates.githubTokens`, then add `?account=name` to the matching GitHub entry. If the account is missing, `updates.key` is used.

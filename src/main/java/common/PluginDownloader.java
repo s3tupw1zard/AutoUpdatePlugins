@@ -1302,9 +1302,23 @@ public class PluginDownloader {
         connection.setReadTimeout(UpdateOptions.readTimeoutMs);
 
         if (UpdateOptions.debug) {
-            logger.info("[DEBUG] OpenConnection url=" + link + ", auth=" + requiresAuth + ", ua=" + ua);
+            boolean authenticated = (requiresAuth && githubToken != null && !githubToken.isEmpty())
+                    || hasNonBlankHeader(extraHeaders, "Authorization")
+                    || hasNonBlankHeader(requestHeaders, "Authorization");
+            logger.info("[DEBUG] OpenConnection url=" + link + ", auth=" + authenticated + ", ua=" + ua);
         }
         return connection;
+    }
+
+    private static boolean hasNonBlankHeader(Map<String, String> headers, String name) {
+        if (headers == null || name == null) return false;
+        for (Map.Entry<String, String> header : headers.entrySet()) {
+            if (header.getKey() != null && name.equalsIgnoreCase(header.getKey())
+                    && header.getValue() != null && !header.getValue().trim().isEmpty()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean hasJava11HttpClient() {
